@@ -1,0 +1,6 @@
+# 桌面调试依赖清单（Windows 本地方便运行 main.py 预览界面）
+# 安装: pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+kivy==2.3.0
+kivymd==1.2.0
+Pillow>=9.0.0
+plyer>=2.1.0

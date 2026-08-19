@@ -1,0 +1,58 @@
+
+[13:15:40] open_bt_dialog EXCEPTION
+Traceback (most recent call last):
+  File "kivy\\_event.pyx", line 235, in kivy._event.EventDispatcher.__init__
+TypeError: object.__init__() takes exactly one argument (the instance to initialize)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "main.py", line 640, in open_bt_dialog
+    content = BTDialogContent()
+  File "main.py", line 724, in __init__
+    self._paired_title = TwoLineListItem(
+  File "D:\Iven_work\test\pychar\venv\lib\site-packages\kivymd\uix\list\list.py", line 1285, in __init__
+    super().__init__(**kwargs)
+  File "D:\Iven_work\test\pychar\venv\lib\site-packages\kivymd\uix\behaviors\declarative_behavior.py", line 311, in __init__
+    super().__init__(**kwargs)
+  File "D:\Iven_work\test\pychar\venv\lib\site-packages\kivymd\theming.py", line 1670, in __init__
+    super().__init__(**kwargs)
+  File "D:\Iven_work\test\pychar\venv\lib\site-packages\kivy\uix\behaviors\button.py", line 121, in __init__
+    super(ButtonBehavior, self).__init__(**kwargs)
+  File "D:\Iven_work\test\pychar\venv\lib\site-packages\kivy\uix\floatlayout.py", line 65, in __init__
+    super(FloatLayout, self).__init__(**kwargs)
+  File "D:\Iven_work\test\pychar\venv\lib\site-packages\kivy\uix\layout.py", line 76, in __init__
+    super(Layout, self).__init__(**kwargs)
+  File "D:\Iven_work\test\pychar\venv\lib\site-packages\kivy\uix\widget.py", line 357, in __init__
+    super(Widget, self).__init__(**kwargs)
+  File "kivy\\_event.pyx", line 238, in kivy._event.EventDispatcher.__init__
+TypeError: Properties ['secondary'] passed to __init__ may not be existing property names. Valid properties are ['_doing_ripple', '_fading_out', '_finishing_ripple', '_height', '_no_ripple_effect', '_ripple_rad', '_round_rad', '_touchable_widgets', '_txt_bot_pad', '_txt_left_pad', '_txt_right_pad', '_txt_top_pad', 'always_release', 'bg_color', 'center', 'center_x', 'center_y', 'children', 'cls', 'device_ios', 'disabled', 'divider', 'divider_color', 'font_style', 'height', 'id', 'ids', 'last_touch', 'min_state_time', 'motion_filter', 'opacity', 'opposite_colors', 'parent', 'pos', 'pos_hint', 'radius', 'right', 'ripple_alpha', 'ripple_canvas_after', 'ripple_color', 'ripple_duration_in_fast', 'ripple_duration_in_slow', 'ripple_duration_out', 'ripple_func_in', 'ripple_func_out', 'ripple_rad_default', 'ripple_scale', 'secondary_font_style', 'secondary_text', 'secondary_text_color', 'secondary_theme_text_color', 'size', 'size_hint', 'size_hint_max', 'size_hint_max_x', 'size_hint_max_y', 'size_hint_min', 'size_hint_min_x', 'size_hint_min_y', 'size_hint_x', 'size_hint_y', 'state', 'tertiary_font_style', 'tertiary_text', 'tertiary_text_color', 'tertiary_theme_text_color', 'text', 'text_color', 'theme_cls', 'theme_text_color', 'top', 'widget_style', 'width', 'x', 'y']
+
+[13:20:21] open_bt_dialog EXCEPTION
+Traceback (most recent call last):
+  File "kivy\\_event.pyx", line 235, in kivy._event.EventDispatcher.__init__
+TypeError: object.__init__() takes exactly one argument (the instance to initialize)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "d:\Iven_work\test\pychar\main.py", line 636, in open_bt_dialog
+    content = BTDialogContent()
+  File "d:\Iven_work\test\pychar\main.py", line 720, in __init__
+    self._paired_title = TwoLineListItem(
+  File "D:\Iven_work\test\pychar\venv\lib\site-packages\kivymd\uix\list\list.py", line 1285, in __init__
+    super().__init__(**kwargs)
+  File "D:\Iven_work\test\pychar\venv\lib\site-packages\kivymd\uix\behaviors\declarative_behavior.py", line 311, in __init__
+    super().__init__(**kwargs)
+  File "D:\Iven_work\test\pychar\venv\lib\site-packages\kivymd\theming.py", line 1670, in __init__
+    super().__init__(**kwargs)
+  File "D:\Iven_work\test\pychar\venv\lib\site-packages\kivy\uix\behaviors\button.py", line 121, in __init__
+    super(ButtonBehavior, self).__init__(**kwargs)
+  File "D:\Iven_work\test\pychar\venv\lib\site-packages\kivy\uix\floatlayout.py", line 65, in __init__
+    super(FloatLayout, self).__init__(**kwargs)
+  File "D:\Iven_work\test\pychar\venv\lib\site-packages\kivy\uix\layout.py", line 76, in __init__
+    super(Layout, self).__init__(**kwargs)
+  File "D:\Iven_work\test\pychar\venv\lib\site-packages\kivy\uix\widget.py", line 357, in __init__
+    super(Widget, self).__init__(**kwargs)
+  File "kivy\\_event.pyx", line 238, in kivy._event.EventDispatcher.__init__
+TypeError: Properties ['secondary'] passed to __init__ may not be existing property names. Valid properties are ['_doing_ripple', '_fading_out', '_finishing_ripple', '_height', '_no_ripple_effect', '_ripple_rad', '_round_rad', '_touchable_widgets', '_txt_bot_pad', '_txt_left_pad', '_txt_right_pad', '_txt_top_pad', 'always_release', 'bg_color', 'center', 'center_x', 'center_y', 'children', 'cls', 'device_ios', 'disabled', 'divider', 'divider_color', 'font_style', 'height', 'id', 'ids', 'last_touch', 'min_state_time', 'motion_filter', 'opacity', 'opposite_colors', 'parent', 'pos', 'pos_hint', 'radius', 'right', 'ripple_alpha', 'ripple_canvas_after', 'ripple_color', 'ripple_duration_in_fast', 'ripple_duration_in_slow', 'ripple_duration_out', 'ripple_func_in', 'ripple_func_out', 'ripple_rad_default', 'ripple_scale', 'secondary_font_style', 'secondary_text', 'secondary_text_color', 'secondary_theme_text_color', 'size', 'size_hint', 'size_hint_max', 'size_hint_max_x', 'size_hint_max_y', 'size_hint_min', 'size_hint_min_x', 'size_hint_min_y', 'size_hint_x', 'size_hint_y', 'state', 'tertiary_font_style', 'tertiary_text', 'tertiary_text_color', 'tertiary_theme_text_color', 'text', 'text_color', 'theme_cls', 'theme_text_color', 'top', 'widget_style', 'width', 'x', 'y']

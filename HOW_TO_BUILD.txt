@@ -1,0 +1,213 @@
+# =========================================================
+# 蓝牙响铃 + 本地播放器 Android APP - 完整使用手册
+# =========================================================
+# 技术栈：Python 3.8+  Kivy 2.3  KivyMD 1.2  Buildozer (打包 APK)
+
+
+# =========================================================
+#  一、项目文件说明
+# =========================================================
+#
+#  main.py           - 应用主程序：UI + 蓝牙 + 播放器
+#  buildozer.spec    - APK 打包配置（Android 权限、依赖、版本、镜像）
+#  requirements.txt  - Windows 本地调试依赖
+#  build_apk.sh      - WSL2 一键构建 APK 脚本 (推荐)
+#  music/            - 本地音频存放目录（首次运行自动创建）
+#  bt_prefs.json     - 历史已连接设备地址（自动生成）
+#
+
+
+# =========================================================
+#  二、功能总览
+# =========================================================
+#
+#  界面 1 - 蓝牙响铃主页：
+#   ┌──────────────────────────┐
+#   │ [音乐] 蓝牙响铃 [蓝牙状态]│ 顶栏
+#   │                          │
+#   │     设备状态卡片          │
+#   │   显示连接状态/设备名     │
+#   │                          │
+#   │  ┌────────┐  ┌────────┐  │
+#   │  │ 响铃🔔  │  │蓝牙连接 │  │  底部按键行
+#   │  └────────┘  └────────┘  │
+#   └──────────────────────────┘
+#
+#  【响铃按钮】 向已连接蓝牙设备发送响铃指令（见 main.py RING_CMD）
+#  【蓝牙按钮】 打开"二级搜索界面"弹窗：
+#     ├─ 上方列表 = 已配对设备（直接点击即可连接）
+#     └─ 下方列表 = 附近扫描到的设备（点击→先配对→再连接）
+#
+#  【自动重连】进入主页自动搜索上次成功连接过的设备，存在即自动连接。
+#
+#  界面 2 - 本地播放器（顶栏左侧音乐图标切换）：
+#   - 扫描指定目录下的 mp3/wav/ogg/flac/m4a/aac
+#   - 播放/暂停/上一首/下一首、进度条
+#   - 歌曲结束自动下一首，单曲列表循环
+#   - 点击"文件夹"图标选择音乐目录
+#
+
+
+# =========================================================
+#  三、Windows 本地调试界面（无需 APK，先看效果）
+# =========================================================
+#
+# 1) 打开 PowerShell / CMD，进入项目目录：
+#     cd D:\Iven_work\test\pychar
+#
+# 2) 创建虚拟环境（可选，推荐）：
+#     python -m venv venv
+#     venv\Scripts\activate
+#
+# 3) 安装依赖（使用清华镜像加速）：
+#     pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# 4) 运行程序看界面：
+#     python main.py
+#
+#    说明：Windows 本地无真实蓝牙设备时，程序进入"桌面模拟模式"
+#    - 已配对列表有 2 个假设备，可点击体验连接流程
+#    - 扫描会陆续弹出 3 个假设备供选择
+#    - 点击"响铃"只会打印 16 进制指令帧（不会真的发）
+#    - 播放器功能完全可用（放几首 mp3 到 music/ 目录即可）
+#
+
+
+# =========================================================
+#  四、编译 APK - 推荐方案（WSL2 + Buildozer）
+# =========================================================
+# Buildozer 官方不支持 Windows 原生，只能在 WSL2/Linux/macOS 构建。
+# 以下是在你现有 Windows 10/11 上用 WSL2 的步骤：
+#
+# --- 步骤 A：启用 WSL2（一次性）
+# 以管理员身份打开 PowerShell，执行：
+#    wsl --install -d Ubuntu-22.04
+# 按提示设置用户名/密码后重启。
+#
+# --- 步骤 B：把项目拷贝到 WSL2 中
+# 打开 Ubuntu 终端，执行（路径根据你的实际目录调整）：
+#    mkdir -p ~/btring
+#    cp -r /mnt/d/Iven_work/test/pychar/* ~/btring/
+#    cd ~/btring
+#
+# --- 步骤 C：执行一键构建脚本
+#    bash build_apk.sh
+#
+#    脚本会自动做：
+#      1) apt 安装 openjdk-17 / python3 / build-essential / cmake 等
+#      2) 配置清华 PyPI 镜像 + 阿里 Maven 镜像
+#      3) pip 安装 buildozer + cython
+#      4) buildozer android debug （首次会下载约 4GB Android SDK/NDK）
+#
+# --- 步骤 D：拿到 APK
+#    成功后在 ~/btring/bin/ 下会有一个类似：
+#       btringplayer-1.0-arm64-v8a-debug.apk
+#    把它复制到 Windows 桌面（例如）：
+#       cp ~/btring/bin/*.apk /mnt/c/Users/EDY/Desktop/
+#
+# --- 步骤 E：安装到手机
+#   方法 1：直接把 APK 文件传到手机上，点击安装
+#   方法 2：USB 连手机 → 开开发者选项 → 开 USB 调试 → 电脑执行：
+#           adb install -r btringplayer-1.0-arm64-v8a-debug.apk
+
+
+# =========================================================
+#  五、编译 APKD - 替代方案 (Google Colab 云端构建，无需 WSL2)
+# =========================================================
+# 如果 WSL2 装不了，可以用 Colab 免费 GPU 实例构建，步骤：
+#
+# 1) 浏览器打开 https://colab.research.google.com/
+# 2) 新建笔记本，运行环境选 Python3 + GPU（其实是 CPU 也可以）
+# 3) 在单元格中依次执行：
+#
+#    ---- 单元格 1：安装依赖 ----
+#    !apt update -y
+#    !apt install -y openjdk-17-jdk python3-pip git autoconf libtool \
+#         pkg-config libncurses5-dev libncursesw5-dev libtinfo5 cmake \
+#         libffi-dev libssl-dev automake build-essential ccache \
+#         zlib1g-dev zip unzip wget
+#    !pip install --upgrade pip buildozer cython==3.0.10
+#
+#    ---- 单元格 2：上传源码（把 main.py / buildozer.spec 上传） ----
+#    from google.colab import files
+#    !mkdir -p /content/btring && cd /content/btring
+#    # 在左侧上传文件后，移动到 /content/btring/ 下
+#    # 或者用下面命令手动写入
+#
+#    ---- 单元格 3：构建 ----
+#    %cd /content/btring
+#    !buildozer android debug 2>&1 | tail -80
+#
+#    ---- 单元格 4：下载 APK ----
+#    from google.colab import files
+#    !ls bin/
+#    files.download('bin/btringplayer-1.0-arm64-v8a-debug.apk')
+#
+# 注意：Colab 单会话 12 小时限制，首次构建 40 分钟内能完成。
+
+
+# =========================================================
+#  六、蓝牙协议自定义（重要！）
+# =========================================================
+# 如果你的目标蓝牙设备响铃协议不是默认的 [AA 55 01 00 01]，
+# 请打开 main.py 找到 RING_CMD 常量（约第 30 行附近）修改：
+#
+#    RING_CMD = bytes([0xAA, 0x55, 0x01, 0x00, 0x01])
+#    改为你的设备实际需要的字节序列即可，例如：
+#    RING_CMD = b"RING\r\n"    # ASCII 指令
+#    或
+#    RING_CMD = bytes([0xFF, 0x01, 0x02, 0x55])
+#
+# 如果设备是 BLE（低功耗蓝牙，非经典 SPP），需要修改连接逻辑：
+#    目前代码走的是经典蓝牙 SPP (UUID 00001101-...)
+#    若用 BLE，需要把 connect() / send_ring_cmd() 中的
+#    createRfcommSocketToServiceRecord 换成
+#    connectGatt + writeCharacteristic，可根据设备具体 UUID 修改。
+#
+
+
+# =========================================================
+#  七、常见问题 FAQ
+# =========================================================
+#
+# Q1: 构建到一半 "Could not download gradle-xxx.jar" 网络超时
+# A1: 网络问题，检查 buildozer.spec 中的 android.maven_repos 是否设置，
+#     执行 bash build_apk.sh 前可手动开代理或重试：
+#       export http_proxy=http://你的代理:端口
+#       export https_proxy=http://你的代理:端口
+#
+# Q2: 安装 APK 后点击蓝牙按钮没反应 / 扫不到设备
+# A2: 需要系统授权！首次启动时系统会弹出多个权限：
+#       - 位置权限（扫描附近蓝牙必须）→ 选"允许"
+#       - 附近设备权限 → 选"允许"
+#       - 存储权限 → 选"允许"
+#     如果误选了拒绝，去 设置 → 应用 → 蓝牙响铃播放器 → 权限 里手动开启。
+#
+# Q3: 配对后连接失败
+# A3: 常见原因：
+#     1) 目标设备不支持 SPP (串口协议) - 需要改为 BLE 逻辑
+#     2) 设备已被其他手机占用连接 - 先断开那台手机
+#     3) 设备 PIN 码不对（首次配对时需要输入）
+#
+# Q4: 播放器找不到音乐
+# A4: 进入播放器界面 → 点文件夹图标 → 选择你的音乐所在目录，
+#     建议选手机的 "Music" 或 "内部存储/Download" 目录。
+#     或者手动把 .mp3 放到手机根目录的 Music/ 下再点刷新按钮。
+#
+# Q5: 想要 Release 签名 APK（上架应用市场）
+# A5: 1) 用 keytool 生成签名密钥：
+#        keytool -genkey -v -keystore my-release-key.jks \
+#            -keyalg RSA -keysize 2048 -validity 10000 -alias btring
+#     2) 在 buildozer.spec 里加上：
+#        android.release_artifact = apk
+#        android.signkey = my-release-key.jks
+#        android.signalias = btring
+#        android.signpass = 你的密钥密码
+#     3) 运行：buildozer android release
+#
+# Q6: 改了代码怎么重新打包？
+# A6: WSL2 中进入项目目录，直接执行：
+#        buildozer android debug
+#     如果改了依赖或构建配置异常，先清理再打：
+#        buildozer android clean
+#        buildozer android debug

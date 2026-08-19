@@ -1,0 +1,24 @@
+[2026/08/19 ÖÜÈý 13:09:02.59] Start 
+[OK] Python 3.8.7
+venv already exists
+Installing requirements
+Looking in indexes: https://pypi.tuna.tsinghua.edu.cn/simple
+Requirement already satisfied: pip in d:\iven_work\test\pychar\venv\lib\site-packages (25.0.1)
+Looking in indexes: https://pypi.tuna.tsinghua.edu.cn/simple
+Requirement already satisfied: kivy==2.3.0 in d:\iven_work\test\pychar\venv\lib\site-packages (from -r D:\Iven_work\test\pychar\requirements.txt (line 3)) (2.3.0)
+Requirement already satisfied: kivymd==1.2.0 in d:\iven_work\test\pychar\venv\lib\site-packages (from -r D:\Iven_work\test\pychar\requirements.txt (line 4)) (1.2.0)
+Requirement already satisfied: Pillow>=9.0.0 in d:\iven_work\test\pychar\venv\lib\site-packages (from -r D:\Iven_work\test\pychar\requirements.txt (line 5)) (10.4.0)
+Requirement already satisfied: plyer>=2.1.0 in d:\iven_work\test\pychar\venv\lib\site-packages (from -r D:\Iven_work\test\pychar\requirements.txt (line 6)) (2.1.0)
+Requirement already satisfied: Kivy-Garden>=0.1.4 in d:\iven_work\test\pychar\venv\lib\site-packages (from kivy==2.3.0->-r D:\Iven_work\test\pychar\requirements.txt (line 3)) (0.1.5)
+Requirement already satisfied: docutils in d:\iven_work\test\pychar\venv\lib\site-packages (from kivy==2.3.0->-r D:\Iven_work\test\pychar\requirements.txt (line 3)) (0.20.1)
+Requirement already satisfied: pygments in d:\iven_work\test\pychar\venv\lib\site-packages (from kivy==2.3.0->-r D:\Iven_work\test\pychar\requirements.txt (line 3)) (2.19.2)
+Requirement already satisfied: kivy-deps.angle~=0.4.0 in d:\iven_work\test\pychar\venv\lib\site-packages (from kivy==2.3.0->-r D:\Iven_work\test\pychar\requirements.txt (line 3)) (0.4.0)
+Requirement already satisfied: kivy-deps.sdl2~=0.7.0 in d:\iven_work\test\pychar\venv\lib\site-packages (from kivy==2.3.0->-r D:\Iven_work\test\pychar\requirements.txt (line 3)) (0.7.0)
+Requirement already satisfied: kivy-deps.glew~=0.3.1 in d:\iven_work\test\pychar\venv\lib\site-packages (from kivy==2.3.0->-r D:\Iven_work\test\pychar\requirements.txt (line 3)) (0.3.1)
+Requirement already satisfied: pypiwin32 in d:\iven_work\test\pychar\venv\lib\site-packages (from kivy==2.3.0->-r D:\Iven_work\test\pychar\requirements.txt (line 3)) (223)
+Requirement already satisfied: requests in d:\iven_work\test\pychar\venv\lib\site-packages (from Kivy-Garden>=0.1.4->kivy==2.3.0->-r D:\Iven_work\test\pychar\requirements.txt (line 3)) (2.32.4)
+Requirement already satisfied: pywin32>=223 in d:\iven_work\test\pychar\venv\lib\site-packages (from pypiwin32->kivy==2.3.0->-r D:\Iven_work\test\pychar\requirements.txt (line 3)) (311)
+Requirement already satisfied: charset_normalizer<4,>=2 in d:\iven_work\test\pychar\venv\lib\site-packages (from requests->Kivy-Garden>=0.1.4->kivy==2.3.0->-r D:\Iven_work\test\pychar\requirements.txt (line 3)) (3.5.1)
+Requirement already satisfied: idna<4,>=2.5 in d:\iven_work\test\pychar\venv\lib\site-packages (from requests->Kivy-Garden>=0.1.4->kivy==2.3.0->-r D:\Iven_work\test\pychar\requirements.txt (line 3)) (3.15)
+Requirement already satisfied: urllib3<3,>=1.21.1 in d:\iven_work\test\pychar\venv\lib\site-packages (from requests->Kivy-Garden>=0.1.4->kivy==2.3.0->-r D:\Iven_work\test\pychar\requirements.txt (line 3)) (2.2.3)
+Requirement already satisfied: certifi>=2017.4.17 in d:\iven_work\test\pychar\venv\lib\site-packages (from requests->Kivy-Garden>=0.1.4->kivy==2.3.0->-r D:\Iven_work\test\pychar\requirements.txt (line 3)) (2026.7.22)
