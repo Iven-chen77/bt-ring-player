@@ -58,25 +58,32 @@ jobs:
           restore-keys: |
             buildozer-cache-v1-${{ runner.os }}-
 
+      # -------- Step 4: 安装 Python 构建工具 --------
       - name: Install buildozer / cython
         run: |
           python3 -m pip install --upgrade pip setuptools wheel
+          # 全局安装（不用 --user），确保所有 Python 路径都能找到
           python3 -m pip install cython buildozer plyvel
 
+      # -------- Step 5: 打印环境（调试用）--------
       - name: Print tool versions
         run: |
-          buildozer --version
+          # 用 python3 -m 方式调用，绕过 shebang 问题
+          python3 -m buildozer --version
           python3 -c "import Cython; print('Cython', Cython.__version__)"
+          python3 -c "import buildozer; print('buildozer at:', buildozer.__file__)"
           echo "JAVA_HOME = $JAVA_HOME"
           echo "PWD = $(pwd)"
           ls -la
 
+      # -------- Step 6: 核心：执行 buildozer 构建 debug APK --------
+      # 用 python3 -m 方式调用，确保模块路径正确
+      # BUILDOZER_HOME 指定缓存目录，不依赖 HOME（HOME 保持系统默认）
       - name: Build APK with Buildozer (debug)
         run: |
           echo "Start building APK. First run downloads SDK/NDK, be patient..."
-          yes | buildozer -v android debug 2>&1 | tee build_apk.log
-        env:
-          HOME: ${{ github.workspace }}/.buildozer_cache
+          BUILDOZER_HOME="${{ github.workspace }}/.buildozer_cache" \
+          yes | python3 -m buildozer -v android debug 2>&1 | tee build_apk.log
         shell: bash
 
       - name: Upload build log
