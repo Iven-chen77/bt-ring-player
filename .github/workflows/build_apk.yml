@@ -1,0 +1,92 @@
+# ============================================================
+# GitHub Actions 云端构建 APK —— 免 WSL / 免虚拟机 / 零本地环境
+# 使用：点 Actions -> 左边选 Build BTRingPlayer APK -> Run workflow
+# ============================================================
+name: Build BTRingPlayer APK
+
+on:
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - 'build_apk.log'
+      - 'venv/**'
+      - '.venv/**'
+  workflow_dispatch:   # 允许手动点 Run workflow 触发
+
+env:
+  PIP_INDEX_URL: "https://pypi.tuna.tsinghua.edu.cn/simple"
+  PIP_TRUSTED_HOST: "pypi.tuna.tsinghua.edu.cn"
+  BUILDOZER_INTERACTIVE: "0"
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            openjdk-17-jdk \
+            git zip unzip \
+            autoconf libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev \
+            libtinfo5 cmake libffi-dev libssl-dev automake \
+            python3-pip python3-dev python3-setuptools python3-wheel
+          java -version
+          python3 --version
+
+      - name: Cache pip & buildozer global dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.buildozer
+            ~/.gradle
+          key: buildozer-cache-v1-${{ runner.os }}-${{ hashFiles('buildozer.spec', 'requirements.txt') }}
+          restore-keys: |
+            buildozer-cache-v1-${{ runner.os }}-
+
+      - name: Install buildozer / cython
+        run: |
+          python3 -m pip install --upgrade pip setuptools wheel
+          python3 -m pip install cython buildozer plyvel
+
+      - name: Print tool versions
+        run: |
+          buildozer --version
+          python3 -c "import Cython; print('Cython', Cython.__version__)"
+          echo "JAVA_HOME = $JAVA_HOME"
+          echo "PWD = $(pwd)"
+          ls -la
+
+      - name: Build APK with Buildozer (debug)
+        run: |
+          echo "Start building APK. First run downloads SDK/NDK, be patient..."
+          yes | buildozer -v android debug 2>&1 | tee build_apk.log
+        env:
+          HOME: ${{ github.workspace }}/.buildozer_cache
+        shell: bash
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build_apk.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BT-RingPlayer-APK
+          path: |
+            bin/*.apk
+          if-no-files-found: error
+          retention-days: 90
