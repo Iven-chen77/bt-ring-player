@@ -42,6 +42,7 @@ android.ndk = 25b
 
 # (str) 支持的 CPU 架构；多个用空格分隔
 # armeabi-v7a = 32位 ARM 兼容最广；arm64-v8a = 64位 ARM（主流）；x86_64 = 模拟器
+android.archs = armeabi-v7a arm64-v8a
 android.storage_dir = .buildozer/android/platform/build
 
 # (str) 入口模块名 (.py 文件名去掉后缀)
