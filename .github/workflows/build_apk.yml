@@ -1,6 +1,6 @@
 # ============================================================
 # GitHub Actions 云端构建 APK —— 免 WSL / 免虚拟机 / 零本地环境
-# 使用：点 Actions -> 左边选 Build BTRingPlayer APK -> Run workflow
+# 使用：把项目推到 GitHub 公开仓库 → Actions → Run workflow → 下载 APK
 # ============================================================
 name: Build BTRingPlayer APK
 
@@ -12,21 +12,39 @@ on:
       - 'build_apk.log'
       - 'venv/**'
       - '.venv/**'
-  workflow_dispatch:   # 允许手动点 Run workflow 触发
+  workflow_dispatch:   # 允许在 Actions 页面手动点击 "Run workflow" 触发
 
+# 全局环境变量
 env:
   PIP_INDEX_URL: "https://pypi.tuna.tsinghua.edu.cn/simple"
   PIP_TRUSTED_HOST: "pypi.tuna.tsinghua.edu.cn"
+  # Buildozer 不要问任何问题
   BUILDOZER_INTERACTIVE: "0"
 
 jobs:
   build-apk:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+    runs-on: ubuntu-latest   # GitHub 官方 Ubuntu 虚拟机（4核 16G 完全足够跑 Buildozer）
+    timeout-minutes: 120     # 首次构建需要下载 SDK/NDK，给足 2 小时
     steps:
+
+      # -------- Step 1: 检出项目代码 --------
       - name: Checkout source code
         uses: actions/checkout@v4
 
+      # -------- Step 1.5: 构建前强制修复 buildozer.spec（双重保险）--------
+      # 无论 GitHub 上的 spec 是否同步成功，这里用 sed 强制：
+      #   1) android.archs 改为单架构 arm64-v8a（避免路径空格 + OOM）
+      #   2) 删除不存在的 android.storage_dir 配置项（buildozer 不识别）
+      - name: Pre-flight fix buildozer.spec
+        run: |
+          echo "Before fix:"
+          grep -E '^android.(archs|storage_dir)' buildozer.spec || true
+          sed -i '/^android\.storage_dir/d' buildozer.spec
+          sed -i -E 's|^android\.archs\s*=.*$|android.archs = arm64-v8a|' buildozer.spec
+          echo "After fix:"
+          grep -E '^android.(archs|storage_dir)' buildozer.spec || true
+
+      # -------- Step 2: 安装系统依赖（Java + Buildozer 编译依赖）--------
       - name: Install system dependencies
         run: |
           sudo apt-get update -y -qq
@@ -41,6 +59,7 @@ jobs:
           java -version
           python3 --version
 
+      # -------- Step 3: 缓存 pip / buildozer 全局缓存（加速下一次构建）--------
       - name: Cache pip & buildozer global dir
         uses: actions/cache@v4
         with:
@@ -71,15 +90,23 @@ jobs:
           ls -la
 
       # -------- Step 6: 核心：执行 buildozer 构建 debug APK --------
-      # 用 python3 -m 方式调用，确保模块路径正确
-      # BUILDOZER_HOME 指定缓存目录，不依赖 HOME（HOME 保持系统默认）
+      # 创建 swap 防止 OOM，去掉 yes 管道避免 broken pipe
       - name: Build APK with Buildozer (debug)
         run: |
+          echo "Creating 4GB swap to prevent OOM..."
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
           echo "Start building APK. First run downloads SDK/NDK, be patient..."
           BUILDOZER_HOME="${{ github.workspace }}/.buildozer_cache" \
-          yes | python3 -m buildozer -v android debug 2>&1 | tee build_apk.log
+          python3 -m buildozer -v android debug 2>&1 | tee build_apk.log
+        env:
+          BUILDOZER_INTERACTIVE: "0"
         shell: bash
 
+      # -------- Step 7: 上传构建日志（失败时方便排查）--------
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
@@ -89,6 +116,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # -------- Step 8: 找到 APK + 上传产物（核心交付物！）--------
       - name: Upload APK artifact
         if: success()
         uses: actions/upload-artifact@v4
@@ -97,4 +125,4 @@ jobs:
           path: |
             bin/*.apk
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 90   # 保留 90 天
