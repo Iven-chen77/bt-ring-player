@@ -1,0 +1,209 @@
+# ============================================================
+# GitHub Actions 云端构建 APK —— 免 WSL / 免虚拟机 / 零本地环境
+# 使用：把项目推到 GitHub 公开仓库 → Actions → Run workflow → 下载 APK
+#
+# 关键说明（踩坑总结）：
+#   1) 千万别设置 BUILDOZER_INTERACTIVE=0 —— 会让 SDK license 默认选 N（拒绝），
+#      导致 build-tools 装不上 -> aidl 找不到 -> 构建失败。
+#   2) 用 GitHub Actions 自带的 Android SDK（$ANDROID_SDK_ROOT），
+#      提前接受所有 license + 安装 build-tools，绕过 buildozer 的交互式提示。
+#   3) 只构建 arm64-v8a：单架构避免 buildozer 在多架构时拼接含空格的存储目录。
+# ============================================================
+name: Build BTRingPlayer APK
+
+on:
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - 'build_apk.log'
+      - 'venv/**'
+      - '.venv/**'
+  workflow_dispatch:   # 允许在 Actions 页面手动点击 "Run workflow" 触发
+
+# =========================================================================
+# 全局环境变量：
+#   *********************************************************************
+#   ** 绝对不要加 BUILDOZER_INTERACTIVE=0 到全局 env！**
+#   它会让 buildozer 在 SDK license 询问 Accept? (y/N) 时自动选 N（拒绝），
+#   导致 Android SDK Build-Tools 安装失败 -> aidl 找不到 -> 构建失败
+#   *********************************************************************
+#   另外：显式指定 ACLOCAL_PATH / M4PATH，防止 Ubuntu 24.04 + autoconf 2.72
+#   下 aclocal 找不到 libtool.m4 -> libffi 编译时 LT_SYS_SYMBOL_USCORE 未定义
+# =========================================================================
+env:
+  PIP_INDEX_URL: "https://pypi.tuna.tsinghua.edu.cn/simple"
+  PIP_TRUSTED_HOST: "pypi.tuna.tsinghua.edu.cn"
+  # 固定 autotools / libtool m4 宏搜索路径（libffi autoreconf 需要 LT_SYS_SYMBOL_USCORE）
+  ACLOCAL_PATH: "/usr/share/aclocal:/usr/local/share/aclocal"
+  M4PATH: "/usr/share/aclocal"
+  # 让 autoreconf / libtoolize 跑在稳定模式
+  AUTOMAKE: "--add-missing --copy --force-missing"
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150   # 首次构建较长，给足 2.5 小时
+    steps:
+
+      # -------- Step 1: 检出项目代码 --------
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # -------- Step 1.5: 构建前强制修复 buildozer.spec（双重保险）--------
+      # 无论 GitHub 上的 spec 是否同步成功，这里用 sed 强制：
+      #   1) 删除不存在的 android.storage_dir 配置项（buildozer 不识别）
+      #   2) 强制单架构 arm64-v8a（避免多架构路径空格 + 节省内存防 OOM）
+      - name: Pre-flight fix buildozer.spec
+        run: |
+          echo "=== Before fix ==="
+          grep -nE '^android\.(archs|storage_dir|buildtools|ndk|api)' buildozer.spec || true
+          sed -i '/^android\.storage_dir/d' buildozer.spec
+          sed -i -E 's|^android\.archs\s*=.*$|android.archs = arm64-v8a|' buildozer.spec
+          echo "=== After fix ==="
+          grep -nE '^android\.(archs|storage_dir|buildtools|ndk|api)' buildozer.spec || true
+        shell: bash
+
+      # -------- Step 2: 安装系统依赖 --------
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            openjdk-17-jdk \
+            git zip unzip \
+            autoconf automake autoconf-archive libtool libtool-bin libltdl-dev pkg-config \
+            zlib1g-dev libffi-dev libssl-dev \
+            cmake \
+            python3-pip python3-dev python3-setuptools python3-wheel \
+            libncurses-dev libtinfo6
+          # --- 关键校验：确认 libtool.m4 里真的定义了 LT_SYS_SYMBOL_USCORE，且 aclocal 能找到 ---
+          echo "=== aclocal system dir ==="
+          aclocal --print-ac-dir
+          echo "=== libtool.m4 contains LT_SYS_SYMBOL_USCORE? ==="
+          grep -l "LT_SYS_SYMBOL_USCORE" /usr/share/aclocal/*.m4 2>/dev/null || echo "(missing! check install)"
+          echo "=== Simulate aclocal scan for macro ==="
+          echo 'AC_DEFUN([LT_SYS_SYMBOL_USCORE])' > /tmp/_check_macro.m4
+          aclocal --verbose --output=/dev/null -I /usr/share/aclocal /tmp/_check_macro.m4 2>&1 | tail -20 || true
+          rm -f /tmp/_check_macro.m4
+          echo "=== libtoolize sanity ==="
+          which libtoolize && libtoolize --version | head -1
+          echo "=== Java ==="
+          java -version
+          echo "=== Python ==="
+          python3 --version
+        shell: bash
+
+      # -------- Step 3: 环境准备（关键：不要创建 buildozer 的 SDK 空目录！）--------
+      # 重要：绝对不要预先创建 ~/.buildozer/android/platform/android-sdk/
+      # buildozer 只要检测到这个目录存在就认为 SDK 已装，不会再下载，
+      # 然后去找 tools/bin/sdkmanager 找不到就直接崩溃。
+      # license 接受交给 yes | yes | 管道，在构建时自动回答 y。
+      - name: Environment check (DO NOT pre-create SDK dir!)
+        run: |
+          echo "=== Pre-build environment check ==="
+          echo "JAVA_HOME = $JAVA_HOME"
+          echo "User home = $HOME"
+          echo "PWD = $(pwd)"
+          # 确保 buildozer 的 SDK 目录不存在（如果因为缓存存在要彻底清空）
+          if [ -d ~/.buildozer/android/platform/android-sdk ]; then
+            if [ ! -f ~/.buildozer/android/platform/android-sdk/tools/bin/sdkmanager ]; then
+              echo "WARNING: SDK dir exists but sdkmanager missing - cleaning up stale dir"
+              rm -rf ~/.buildozer/android/platform/android-sdk
+            fi
+          fi
+          echo "Ensure buildozer SDK dir is NOT pre-created:"
+          ls -la ~/.buildozer/android/platform/ 2>/dev/null || echo "(dir does not exist yet -> OK, buildozer will download SDK)"
+        shell: bash
+
+      # -------- Step 4: 缓存（加速第二次构建）--------
+      - name: Cache pip & buildozer global dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.buildozer
+            ~/.gradle
+          key: buildozer-cache-v7-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-cache-v7-${{ runner.os }}-
+
+      # -------- Step 5: 安装 Python 构建工具 --------
+      - name: Install buildozer / cython
+        run: |
+          python3 -m pip install --upgrade pip setuptools wheel
+          python3 -m pip install cython buildozer plyvel
+        shell: bash
+
+      # -------- Step 6: 打印环境（调试用）--------
+      - name: Print tool versions
+        run: |
+          python3 -m buildozer --version
+          python3 -c "import Cython; print('Cython', Cython.__version__)"
+          echo "JAVA_HOME = $JAVA_HOME"
+          echo "ANDROID_SDK_ROOT = $ANDROID_SDK_ROOT"
+          echo "PWD = $(pwd)"
+          ls -la
+        shell: bash
+
+      # -------- Step 7: 构建 APK（核心步骤）--------
+      # 说明：
+      #   - yes | yes | ：双重 y 输入，保证任何交互式提问（accept licenses 等）都选 y
+      #   - BUILDOZER_HOME：指定缓存目录到工作区（HOME 保留系统默认，不再干扰 pip 路径）
+      #   - exit ${PIPESTATUS[1]}：取 buildozer 的退出码，不是 tee 的，也不是 yes 的
+      #   - /tmp/swapfile：4GB 虚拟内存防 OOM（GitHub runner 只有 7GB 物理内存）
+      - name: Build APK with Buildozer (debug)
+        run: |
+          # 必须关闭 pipefail：否则 yes 被打断的 "Broken pipe" 会让整个管道返回非 0
+          set +o pipefail
+          echo "=== Creating swap (best effort) ==="
+          sudo swapoff /tmp/swapfile 2>/dev/null || true
+          sudo rm -f /tmp/swapfile 2>/dev/null || true
+          if sudo dd if=/dev/zero of=/tmp/swapfile bs=1M count=4096 status=none 2>/dev/null; then
+            sudo chmod 600 /tmp/swapfile
+            sudo mkswap /tmp/swapfile 2>/dev/null
+            sudo swapon /tmp/swapfile 2>/dev/null && echo "Swap enabled OK" || echo "Swap skipped (non-fatal)"
+          else
+            echo "Swap skipped (non-fatal, continuing build)"
+          fi
+          free -h
+          echo ""
+          # --- 在构建前先把 autotools env 再次显式注入（全局 env 已经带了，这里再做一次双保险）---
+          export ACLOCAL_PATH="/usr/share/aclocal:/usr/local/share/aclocal:${ACLOCAL_PATH:-}"
+          export M4PATH="/usr/share/aclocal:${M4PATH:-}"
+          echo "ACLOCAL_PATH=$ACLOCAL_PATH"
+          echo "M4PATH=$M4PATH"
+          echo ""
+          echo "=========================================="
+          echo "Start building APK (first run ~30-60 min)"
+          echo "=========================================="
+          # 双 yes 管道：任何 buildozer / sdkmanager 的 y/n 提问都自动回答 y
+          yes 2>/dev/null | yes 2>/dev/null | \
+            BUILDOZER_HOME="${{ github.workspace }}/.buildozer_cache" \
+            python3 -m buildozer -v android debug 2>&1 | tee build_apk.log
+          # 取 buildozer 的退出码（PIPESTATUS[2]：yes | yes | buildozer | tee）
+          BUILD_EXIT=${PIPESTATUS[2]}
+          echo ""
+          echo "Buildozer exit code: $BUILD_EXIT"
+          exit $BUILD_EXIT
+        shell: bash
+
+      # -------- Step 8: 上传构建日志（失败时方便排查）--------
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build_apk.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # -------- Step 9: 上传 APK 产物（核心交付物！）--------
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BT-RingPlayer-APK
+          path: |
+            bin/*.apk
+          if-no-files-found: error
+          retention-days: 90
