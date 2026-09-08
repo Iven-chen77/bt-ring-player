@@ -148,8 +148,8 @@ jobs:
       # -------- Step 7: 构建 APK（核心步骤）--------
       # 说明：
       #   - yes | yes | ：双重 y 输入，保证任何交互式提问（accept licenses 等）都选 y
-      #   - BUILDOZER_HOME：指定缓存目录到工作区（HOME 保留系统默认，不再干扰 pip 路径）
-      #   - exit ${PIPESTATUS[1]}：取 buildozer 的退出码，不是 tee 的，也不是 yes 的
+      #   - set +o pipefail：防止 yes 断管道把整个状态变非 0
+      #   - exit ${PIPESTATUS[2]}：取 buildozer 的退出码（第 3 个管道命令）
       #   - /tmp/swapfile：4GB 虚拟内存防 OOM（GitHub runner 只有 7GB 物理内存）
       - name: Build APK with Buildozer (debug)
         run: |
@@ -177,8 +177,8 @@ jobs:
           echo "Start building APK (first run ~30-60 min)"
           echo "=========================================="
           # 双 yes 管道：任何 buildozer / sdkmanager 的 y/n 提问都自动回答 y
+          # 不设 BUILDOZER_HOME：让 buildozer 使用默认 ~/.buildozer（和缓存路径一致）
           yes 2>/dev/null | yes 2>/dev/null | \
-            BUILDOZER_HOME="${{ github.workspace }}/.buildozer_cache" \
             python3 -m buildozer -v android debug 2>&1 | tee build_apk.log
           # 取 buildozer 的退出码（PIPESTATUS[2]：yes | yes | buildozer | tee）
           BUILD_EXIT=${PIPESTATUS[2]}
