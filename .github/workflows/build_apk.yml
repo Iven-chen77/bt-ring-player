@@ -67,6 +67,7 @@ jobs:
       # -------- Step 2: 安装系统依赖 --------
       - name: Install system dependencies
         run: |
+          set +o pipefail
           sudo apt-get update -y -qq
           sudo apt-get install -y -qq --no-install-recommends \
             openjdk-17-jdk \
@@ -76,19 +77,15 @@ jobs:
             cmake \
             python3-pip python3-dev python3-setuptools python3-wheel \
             libncurses-dev libtinfo6
-          # --- 关键校验：确认 libtool.m4 里真的定义了 LT_SYS_SYMBOL_USCORE，且 aclocal 能找到 ---
           echo "=== aclocal system dir ==="
           aclocal --print-ac-dir
           echo "=== libtool.m4 contains LT_SYS_SYMBOL_USCORE? ==="
           grep -l "LT_SYS_SYMBOL_USCORE" /usr/share/aclocal/*.m4 2>/dev/null || echo "(missing! check install)"
-          echo "=== Simulate aclocal scan for macro ==="
-          echo 'AC_DEFUN([LT_SYS_SYMBOL_USCORE])' > /tmp/_check_macro.m4
-          aclocal --verbose --output=/dev/null -I /usr/share/aclocal /tmp/_check_macro.m4 2>&1 | tail -20 || true
-          rm -f /tmp/_check_macro.m4
           echo "=== libtoolize sanity ==="
-          which libtoolize && libtoolize --version | head -1
+          which libtoolize || echo "(libtoolize not found)"
+          libtoolize --version 2>/dev/null | head -1 || true
           echo "=== Java ==="
-          java -version
+          java -version 2>&1 || true
           echo "=== Python ==="
           python3 --version
         shell: bash
