@@ -142,7 +142,36 @@ jobs:
           ls -la
         shell: bash
 
-      # -------- Step 7: 构建 APK（核心步骤）--------
+      # -------- Step 7: 预下载 freetype（savannah.gnu.org 经常 502/504）--------
+      - name: Pre-download freetype source
+        run: |
+          # p4a 把 freetype 下载到工作区的 .buildozer 目录下
+          FT_DIR="$GITHUB_WORKSPACE/.buildozer/android/platform/build-arm64-v8a/packages/freetype"
+          mkdir -p "$FT_DIR"
+          cd "$FT_DIR"
+          # 尝试多个镜像源下载 freetype 2.14.1
+          for url in \
+            "https://download.savannah.gnu.org/releases/freetype/freetype-2.14.1.tar.gz" \
+            "https://github.com/freetype/freetype/releases/download/VER-2-14-1/freetype-2.14.1.tar.gz" \
+            "https://sourceforge.net/projects/freetype/files/freetype2/2.14.1/freetype-2.14.1.tar.gz/download" \
+            "https://fossies.org/linux/misc/freetype-2.14.1.tar.gz"; do
+            echo "Trying: $url"
+            if wget -q --timeout=60 -O freetype-2.14.1.tar.gz "$url" && [ -s freetype-2.14.1.tar.gz ]; then
+              echo "SUCCESS: Downloaded from $url ($(stat -c%s freetype-2.14.1.tar.gz) bytes)"
+              break
+            fi
+            echo "FAILED: $url, trying next..."
+            rm -f freetype-2.14.1.tar.gz
+          done
+          if [ -s freetype-2.14.1.tar.gz ]; then
+            echo "Freetype source ready."
+          else
+            echo "WARNING: All mirrors failed, p4a will try again during build"
+          fi
+          ls -la
+        shell: bash
+
+      # -------- Step 8: 构建 APK（核心步骤）--------
       # 说明：
       #   - yes | yes | ：双重 y 输入，保证任何交互式提问（accept licenses 等）都选 y
       #   - set +o pipefail：防止 yes 断管道把整个状态变非 0
