@@ -37,8 +37,9 @@ android.minapi = 24
 # (int) Android SDK build-tools 版本（和 NDK/SDK 配套）
 android.buildtools = 33.0.3
 
-# (str) Android NDK 版本（必须和 SDK/API 级别配套，API33 → NDK r25b）
-android.ndk = 25b
+# (str) Android NDK 版本
+# r23c 兼容 Kivy 2.3.0 的 OpenGL ES 头文件（r25b 的 glVertexAttribPointer 签名变了导致编译失败）
+android.ndk = 23c
 
 # (str) 支持的 CPU 架构
 # 只构建 arm64-v8a（99% 现代手机支持）
