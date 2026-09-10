@@ -424,10 +424,25 @@ class BluetoothService:
                 def onReceive(self, context, intent):
                     action = intent.getAction()
                     if action == "android.bluetooth.device.action.FOUND":
-                        dev = intent.getParcelableExtra("android.bluetooth.device.extra.DEVICE")
-                        rssi = intent.getShortExtra("android.bluetooth.device.extra.RSSI", 0)
-                        name = dev.getName()
-                        addr = dev.getAddress()
+                        # Android 13+ getParcelableExtra(String) 已废弃返回 null
+                        # 必须用 getParcelableExtra(String, Class) (API 33+)
+                        BluetoothDevice_cls = self.outer._autoclass("android.bluetooth.BluetoothDevice")
+                        try:
+                            dev = intent.getParcelableExtra("android.bluetooth.device.extra.DEVICE", BluetoothDevice_cls)
+                        except Exception:
+                            dev = intent.getParcelableExtra("android.bluetooth.device.extra.DEVICE")
+                        if dev is None:
+                            print("[BT] onReceive: device is null (getParcelableExtra failed)")
+                            return
+                        rssi = intent.getShortExtra("android.bluetooth.device.extra.RSSI", -999)
+                        try:
+                            name = dev.getName()
+                        except Exception:
+                            name = None
+                        try:
+                            addr = dev.getAddress()
+                        except Exception:
+                            addr = "(unknown)"
                         if not name:
                             name = "(未命名)"
                         info = {"name": name, "address": addr, "rssi": int(rssi)}
@@ -435,6 +450,8 @@ class BluetoothService:
 
             self._scan_receiver = ScanReceiver(self)
             flt = IntentFilter("android.bluetooth.device.action.FOUND")
+            # 确保 autoclass 在回调中可用
+            self._autoclass = autoclass
             # Android 14 (API 34) 要求 registerReceiver 必须指定 ReceiverFlags
             # Context.RECEIVER_NOT_EXPORTED = 4
             try:
@@ -987,8 +1004,69 @@ class PlayerScreen(Screen):
     def _on_dir_selected(self, selection):
         if not selection:
             return
-        self.music_dir = selection[0]
-        self.refresh_songs()
+        path = selection[0]
+        if platform == "android" and str(path).startswith("content://"):
+            # SAF content URI: 用 DocumentFile API 遍历
+            self._scan_saf_dir(path)
+        else:
+            self.music_dir = path
+            self.refresh_songs()
+
+    def _scan_saf_dir(self, content_uri):
+        """Android 13+ SAF: 用 DocumentFile 遍历 content URI"""
+        self.ids.song_list.clear_widgets()
+        self.songs = []
+        try:
+            from jnius import autoclass
+            ContentResolver = autoclass("android.content.ContentResolver")
+            Uri = autoclass("android.net.Uri")
+            DocumentFile = autoclass("androidx.documentfile.provider.DocumentFile")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+
+            uri = Uri.parse(content_uri)
+            tree = DocumentFile.fromTreeUri(uri)
+            if tree is None or not tree.isDirectory():
+                App.get_running_app().toast("无法访问所选目录")
+                return
+
+            def _scan_dir(doc_dir, depth=0):
+                if depth > 5:
+                    return
+                files = doc_dir.listFiles()
+                if files is None:
+                    return
+                for f in files:
+                    if f.isDirectory():
+                        _scan_dir(f, depth + 1)
+                    elif f.isFile():
+                        name = f.getName()
+                        if name and name.lower().endswith(AUDIO_EXTS):
+                            uri_str = f.getUri().toString()
+                            self.songs.append((name, uri_str))
+                            item = OneLineListItem(
+                                text=name,
+                                on_release=lambda x, idx=len(self.songs)-1: self.play_at(idx),
+                            )
+                            try:
+                                item.font_name = APP_FONT_NAME
+                            except Exception:
+                                pass
+                            try:
+                                item.ids._lbl_primary.font_name = APP_FONT_NAME
+                            except Exception:
+                                pass
+                            self.ids.song_list.add_widget(item)
+
+            _scan_dir(tree)
+            self.music_dir = content_uri
+            if not self.songs:
+                App.get_running_app().toast("未发现音频文件")
+            else:
+                App.get_running_app().toast(f"找到 {len(self.songs)} 首歌曲")
+        except Exception as e:
+            print(f"[Player] SAF scan error: {e}")
+            App.get_running_app().toast(f"扫描失败: {e}", error=True)
 
     def refresh_songs(self):
         self.ids.song_list.clear_widgets()
@@ -997,7 +1075,11 @@ class PlayerScreen(Screen):
         if not base:
             self.pick_dir()
             return
-        # 递归扫描
+        # 如果是 content URI 走 SAF
+        if base.startswith("content://"):
+            self._scan_saf_dir(base)
+            return
+        # 普通文件路径递归扫描
         for root, dirs, files in os.walk(base):
             for f in sorted(files):
                 if f.lower().endswith(AUDIO_EXTS):
@@ -1007,7 +1089,6 @@ class PlayerScreen(Screen):
                         text=f,
                         on_release=lambda x, idx=len(self.songs)-1: self.play_at(idx),
                     )
-                    # 设置中文字体：歌曲文件名可能是中文
                     try:
                         item.font_name = APP_FONT_NAME
                     except Exception:
@@ -1033,6 +1114,12 @@ class PlayerScreen(Screen):
                 self._sound.unload()
             except Exception:
                 pass
+        # SAF content URI: 先复制到临时文件再播放
+        if path.startswith("content://"):
+            path = self._saf_to_temp(path)
+            if not path:
+                App.get_running_app().toast("无法读取音频文件", error=True)
+                return
         self._sound = SoundLoader.load(path)
         if not self._sound:
             App.get_running_app().toast("无法播放此格式", error=True)
@@ -1044,6 +1131,42 @@ class PlayerScreen(Screen):
         if self._progress_ev:
             self._progress_ev.cancel()
         self._progress_ev = Clock.schedule_interval(self._update_progress, 0.5)
+
+    def _saf_to_temp(self, content_uri_str):
+        """将 SAF content URI 的音频文件复制到 app 临时目录后返回路径"""
+        try:
+            from jnius import autoclass
+            Uri = autoclass("android.net.Uri")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+            resolver = activity.getContentResolver()
+
+            uri = Uri.parse(content_uri_str)
+            is_input = resolver.openInputStream(uri)
+            if is_input is None:
+                print(f"[Player] openInputStream returned null for {content_uri_str}")
+                return None
+
+            import tempfile
+            ext = ".mp3"
+            for e in AUDIO_EXTS:
+                if content_uri_str.lower().endswith(e[1:]):
+                    ext = e
+                    break
+            tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False, dir=APP_FOLDER)
+            buf = bytearray(8192)
+            stream = is_input
+            while True:
+                n = stream.read(buf, 0, 8192)
+                if n <= 0:
+                    break
+                tmp.write(bytes(buf[:n]))
+            tmp.close()
+            stream.close()
+            return tmp.name
+        except Exception as e:
+            print(f"[Player] SAF to temp error: {e}")
+            return None
 
     def _update_progress(self, dt):
         s = self._sound
