@@ -56,14 +56,22 @@ CRASH_LOG = join(APP_FOLDER, "crash.log")
 def _resolve_default_music_dir():
     """跨平台默认音乐目录：
     - 桌面: APP_FOLDER/music（随项目走）
-    - Android: 公共外部存储的 Music/ 目录（用户容易把 mp3 放进去），
-               不可用时 fallback 到 APP_FOLDER/music
+    - Android: 优先用 app 私有存储目录（不需要存储权限），用户可通过「选择目录」按钮选公共目录
     """
     try:
         from kivy.utils import platform
     except Exception:
         platform = None
     if platform == "android":
+        # Android 13+ Scoped Storage: 优先用 app 私有目录（不需要权限）
+        try:
+            from android.storage import app_storage_path
+            d = join(app_storage_path(), "music")
+            os.makedirs(d, exist_ok=True)
+            return d
+        except Exception:
+            pass
+        # 兼容旧版 Android
         try:
             from android.storage import primary_external_storage_path
             ext = primary_external_storage_path()
@@ -77,18 +85,6 @@ def _resolve_default_music_dir():
                 return d
             except Exception:
                 pass
-        except Exception:
-            pass
-        # 兜底下载目录
-        try:
-            from plyer import storagepath
-            d = storagepath.get_downloads_dir()
-            if d:
-                try:
-                    os.makedirs(d, exist_ok=True)
-                    return d
-                except Exception:
-                    pass
         except Exception:
             pass
     d = join(APP_FOLDER, "music")
@@ -315,8 +311,29 @@ class BluetoothService:
             # SPP 标准 UUID
             self._spp_uuid = self._UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
             self._cast = cast
+            self._permissions_granted = False
+            # 延迟检查权限是否已授予
+            Clock.schedule_once(self._check_bt_permissions, 2.0)
         except Exception as e:
             print(f"[BT] Android init error: {e}")
+
+    def _check_bt_permissions(self, dt):
+        """检查蓝牙权限是否已授予，未授予则再次请求"""
+        try:
+            from jnius import autoclass
+            from android.permissions import request_permissions, Permission, check_permission
+            perms_needed = []
+            for p in [Permission.BLUETOOTH_SCAN, Permission.BLUETOOTH_CONNECT, Permission.ACCESS_FINE_LOCATION]:
+                if not check_permission(p):
+                    perms_needed.append(p)
+            if perms_needed:
+                print(f"[BT] Permissions not granted yet: {perms_needed}, requesting again...")
+                request_permissions(perms_needed)
+            else:
+                self._permissions_granted = True
+                print("[BT] All permissions granted")
+        except Exception as e:
+            print(f"[BT] Permission check error: {e}")
 
     # -------- 扫描已配对设备 --------
     def get_paired_devices(self):
@@ -362,6 +379,30 @@ class BluetoothService:
             threading.Thread(target=_sim, daemon=True).start()
             return
         # Android 原生扫描
+        try:
+            # 先确保权限已授予
+            from android.permissions import check_permission, Permission
+            bt_scan_ok = check_permission(Permission.BLUETOOTH_SCAN)
+            bt_connect_ok = check_permission(Permission.BLUETOOTH_CONNECT)
+            loc_ok = check_permission(Permission.ACCESS_FINE_LOCATION)
+            if not (bt_scan_ok and bt_connect_ok and loc_ok):
+                print(f"[BT] Permissions not ready: scan={bt_scan_ok}, connect={bt_connect_ok}, loc={loc_ok}")
+                # 再次请求权限，然后延迟 3 秒再开始扫描
+                from android.permissions import request_permissions
+                request_permissions([Permission.BLUETOOTH_SCAN, Permission.BLUETOOTH_CONNECT, Permission.ACCESS_FINE_LOCATION])
+                def _delayed_scan():
+                    time.sleep(3)
+                    self._do_start_scan(callback)
+                threading.Thread(target=_delayed_scan, daemon=True).start()
+                return
+            self._do_start_scan(callback)
+        except Exception as e:
+            print(f"[BT] scan permission error: {e}")
+            # 权限检查失败也尝试扫描
+            self._do_start_scan(callback)
+
+    def _do_start_scan(self, callback):
+        """实际执行蓝牙扫描"""
         try:
             self.enable_bt()
             from jnius import autoclass, PythonJavaClass, java_method
