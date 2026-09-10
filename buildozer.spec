@@ -59,7 +59,6 @@ android.allow_backup = True
 #   BLUETOOTH_SCAN / BLUETOOTH_CONNECT = Android 12+ 必须
 #   ACCESS_FINE_LOCATION = 扫描蓝牙经典设备需要（Android 11 及以下）
 #   READ_MEDIA_AUDIO = Android 13+ 读取音频
-#   WRITE_EXTERNAL_STORAGE / READ_EXTERNAL_STORAGE = Android 12 及以下
 android.permissions = BLUETOOTH, \
     BLUETOOTH_ADMIN, \
     BLUETOOTH_SCAN, \
@@ -73,7 +72,8 @@ android.permissions = BLUETOOTH, \
     INTERNET, \
     VIBRATE, \
     WAKE_LOCK, \
-    FOREGROUND_SERVICE
+    FOREGROUND_SERVICE, \
+    FOREGROUND_SERVICE_CONNECTED_DEVICE
 
 # (str) 应用图标路径 (放一张 512x512 的 png 到项目根目录并改这里)
 # icon.filename = %(source.dir)s/data/icon.png

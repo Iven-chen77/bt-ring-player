@@ -394,7 +394,13 @@ class BluetoothService:
 
             self._scan_receiver = ScanReceiver(self)
             flt = IntentFilter("android.bluetooth.device.action.FOUND")
-            activity.registerReceiver(self._scan_receiver, flt)
+            # Android 14 (API 34) 要求 registerReceiver 必须指定 ReceiverFlags
+            # Context.RECEIVER_NOT_EXPORTED = 4
+            try:
+                activity.registerReceiver(self._scan_receiver, flt, 4)
+            except Exception:
+                # 旧版 Android 不支持 3 参数版本
+                activity.registerReceiver(self._scan_receiver, flt)
             self._bt_adapter.startDiscovery()
             # 12秒后自动停止扫描
             def _stop():
