@@ -412,7 +412,33 @@ class BluetoothService:
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             activity = PythonActivity.mActivity
 
-            # 广播接收器
+            # 检查蓝牙适配器状态
+            if not self._bt_adapter:
+                print("[BT] No bluetooth adapter!")
+                Clock.schedule_once(lambda dt, msg="无蓝牙适配器": callback({"name": msg, "address": "", "rssi": 0}), 0)
+                return
+            if not self._bt_adapter.isEnabled():
+                print("[BT] Bluetooth not enabled, trying to enable...")
+                self._bt_adapter.enable()
+                time.sleep(2)
+                if not self._bt_adapter.isEnabled():
+                    print("[BT] Bluetooth still not enabled")
+                    Clock.schedule_once(lambda dt, msg="蓝牙未开启，请手动开启蓝牙": callback({"name": msg, "address": "", "rssi": 0}), 0)
+                    return
+
+            # 检查位置服务是否开启（Android 蓝牙扫描需要）
+            try:
+                loc_manager = activity.getSystemService(Context.LOCATION_SERVICE)
+                if loc_manager and not loc_manager.isProviderEnabled("gps") and not loc_manager.isProviderEnabled("network"):
+                    print("[BT] Location service not enabled!")
+                    Clock.schedule_once(lambda dt: callback({"name": "请开启手机位置服务(GPS)后再扫描", "address": "", "rssi": 0}), 0)
+                    return
+            except Exception as e:
+                print(f"[BT] Location check error: {e}")
+
+            print(f"[BT] Starting discovery... adapter={self._bt_adapter}")
+
+            # 广播接收器（必须先注册，再开始扫描，否则漏掉早期设备）
             class ScanReceiver(PythonJavaClass):
                 __javainterfaces__ = ["android/content/BroadcastReceiver"]
 
@@ -459,7 +485,9 @@ class BluetoothService:
             except Exception:
                 # 旧版 Android 不支持 3 参数版本
                 activity.registerReceiver(self._scan_receiver, flt)
-            self._bt_adapter.startDiscovery()
+            # 先注册广播，再开始扫描
+            result = self._bt_adapter.startDiscovery()
+            print(f"[BT] startDiscovery() returned: {result}")
             # 12秒后自动停止扫描
             def _stop():
                 time.sleep(12)
@@ -971,14 +999,11 @@ class PlayerScreen(Screen):
         pass
 
     def pick_dir(self):
-        """选择音乐目录（Android 走 plyer，桌面提示用户配置）"""
+        """选择音乐目录（Android 直接用 MediaStore，桌面手动选择）"""
         if platform == "android":
-            try:
-                from plyer import filechooser
-                filechooser.choose_dir(on_selection=self._on_dir_selected)
-                return
-            except Exception as e:
-                App.get_running_app().toast(f"目录选择失败: {e}", error=True)
+            # Android: 直接用 MediaStore 查询所有音频
+            self.refresh_songs()
+            return
         # 桌面默认：使用用户音乐目录或app下music子目录
         home = os.path.expanduser("~")
         candidates = [
@@ -1005,79 +1030,98 @@ class PlayerScreen(Screen):
         if not selection:
             return
         path = selection[0]
-        if platform == "android" and str(path).startswith("content://"):
-            # SAF content URI: 用 DocumentFile API 遍历
-            self._scan_saf_dir(path)
-        else:
-            self.music_dir = path
-            self.refresh_songs()
+        self.music_dir = path
+        self.refresh_songs()
 
-    def _scan_saf_dir(self, content_uri):
-        """Android 13+ SAF: 用 DocumentFile 遍历 content URI"""
+    def _scan_android_mediastore(self):
+        """Android: 用 MediaStore API 查询所有音频文件（不需要文件权限）"""
         self.ids.song_list.clear_widgets()
         self.songs = []
         try:
             from jnius import autoclass
-            ContentResolver = autoclass("android.content.ContentResolver")
+            MediaStore = autoclass("android.provider.MediaStore")
             Uri = autoclass("android.net.Uri")
-            DocumentFile = autoclass("androidx.documentfile.provider.DocumentFile")
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             activity = PythonActivity.mActivity
+            resolver = activity.getContentResolver()
 
-            uri = Uri.parse(content_uri)
-            tree = DocumentFile.fromTreeUri(uri)
-            if tree is None or not tree.isDirectory():
-                App.get_running_app().toast("无法访问所选目录")
+            # 查询所有音频文件
+            audio_uri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+            projection = [
+                "_id",
+                "_display_name",
+                "_data",
+                "title",
+                "artist",
+                "duration",
+            ]
+            # Android 10+ 用 _display_name，旧版用 _data
+            cursor = resolver.query(audio_uri, projection, None, None, "title ASC")
+            if cursor is None:
+                App.get_running_app().toast("无法访问媒体库")
                 return
 
-            def _scan_dir(doc_dir, depth=0):
-                if depth > 5:
-                    return
-                files = doc_dir.listFiles()
-                if files is None:
-                    return
-                for f in files:
-                    if f.isDirectory():
-                        _scan_dir(f, depth + 1)
-                    elif f.isFile():
-                        name = f.getName()
-                        if name and name.lower().endswith(AUDIO_EXTS):
-                            uri_str = f.getUri().toString()
-                            self.songs.append((name, uri_str))
-                            item = OneLineListItem(
-                                text=name,
-                                on_release=lambda x, idx=len(self.songs)-1: self.play_at(idx),
-                            )
-                            try:
-                                item.font_name = APP_FONT_NAME
-                            except Exception:
-                                pass
-                            try:
-                                item.ids._lbl_primary.font_name = APP_FONT_NAME
-                            except Exception:
-                                pass
-                            self.ids.song_list.add_widget(item)
+            count = 0
+            while cursor.moveToNext():
+                try:
+                    name = cursor.getString(cursor.getColumnIndexOrThrow("_display_name"))
+                except Exception:
+                    try:
+                        data = cursor.getString(cursor.getColumnIndexOrThrow("_data"))
+                        name = data.split("/")[-1] if data else f"audio_{count}"
+                    except Exception:
+                        name = f"audio_{count}"
+                if not name:
+                    name = f"audio_{count}"
 
-            _scan_dir(tree)
-            self.music_dir = content_uri
-            if not self.songs:
+                # 构建 content URI
+                try:
+                    id_col = cursor.getColumnIndexOrThrow("_id")
+                    item_id = cursor.getString(id_col)
+                    content_uri = Uri.withAppendedPath(audio_uri, item_id)
+                    uri_str = content_uri.toString()
+                except Exception:
+                    try:
+                        data = cursor.getString(cursor.getColumnIndexOrThrow("_data"))
+                        uri_str = data
+                    except Exception:
+                        continue
+
+                self.songs.append((name, uri_str))
+                item = OneLineListItem(
+                    text=name,
+                    on_release=lambda x, idx=len(self.songs)-1: self.play_at(idx),
+                )
+                try:
+                    item.font_name = APP_FONT_NAME
+                except Exception:
+                    pass
+                try:
+                    item.ids._lbl_primary.font_name = APP_FONT_NAME
+                except Exception:
+                    pass
+                self.ids.song_list.add_widget(item)
+                count += 1
+
+            cursor.close()
+            if count == 0:
                 App.get_running_app().toast("未发现音频文件")
             else:
-                App.get_running_app().toast(f"找到 {len(self.songs)} 首歌曲")
+                App.get_running_app().toast(f"找到 {count} 首歌曲")
         except Exception as e:
-            print(f"[Player] SAF scan error: {e}")
+            print(f"[Player] MediaStore scan error: {e}")
             App.get_running_app().toast(f"扫描失败: {e}", error=True)
 
     def refresh_songs(self):
         self.ids.song_list.clear_widgets()
         self.songs = []
+        # Android: 直接用 MediaStore API 查询所有音频
+        if platform == "android":
+            self._scan_android_mediastore()
+            return
         base = self.music_dir
         if not base:
             self.pick_dir()
-            return
-        # 如果是 content URI 走 SAF
-        if base.startswith("content://"):
-            self._scan_saf_dir(base)
             return
         # 普通文件路径递归扫描
         for root, dirs, files in os.walk(base):
