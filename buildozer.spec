@@ -25,7 +25,7 @@ version = 1.0
 # (list) 应用需求 - Python 库
 # 注意：kivymd 1.2.0 需要配合 kivy>=2.2.0
 # 注意：sdl2_* 这些是 p4a 内置 recipe 名，不要放在 requirements 里（会报错），kivy 会自动依赖
-requirements = python3,kivy==2.3.0,kivymd==1.2.0,pillow,plyer,android
+requirements = python3,kivy==2.3.1,cython==3.0.11,kivymd==1.2.0,pillow,plyer,android
 
 # (str) 预设的 Android API 级别
 # 33 = Android 13，34 = Android 14（推荐 33，兼容性更稳）
@@ -37,9 +37,8 @@ android.minapi = 24
 # (int) Android SDK build-tools 版本（和 NDK/SDK 配套）
 android.buildtools = 33.0.3
 
-# (str) Android NDK 版本
-# r23c 兼容 Kivy 2.3.0 的 OpenGL ES 头文件（r25b 的 glVertexAttribPointer 签名变了导致编译失败）
-android.ndk = 23c
+# (str) Android NDK 版本（p4a 最低要求 r25）
+android.ndk = 25b
 
 # (str) 支持的 CPU 架构
 # 只构建 arm64-v8a（99% 现代手机支持）

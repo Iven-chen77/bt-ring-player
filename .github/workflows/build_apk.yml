@@ -120,15 +120,15 @@ jobs:
             ~/.cache/pip
             ~/.buildozer
             ~/.gradle
-          key: buildozer-cache-v7-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-cache-v8-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-cache-v7-${{ runner.os }}-
+            buildozer-cache-v8-${{ runner.os }}-
 
       # -------- Step 5: 安装 Python 构建工具 --------
       - name: Install buildozer / cython
         run: |
           python3 -m pip install --upgrade pip setuptools wheel
-          python3 -m pip install cython buildozer plyvel
+          python3 -m pip install "cython==3.0.11" buildozer plyvel
         shell: bash
 
       # -------- Step 6: 打印环境（调试用）--------
