@@ -261,6 +261,113 @@ AUDIO_EXTS = (".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac")
 
 
 # ================= 蓝牙服务层 (跨平台封装) =================
+
+# 模块级定义 Java 回调类（定义在方法内部会导致 jnius 注册不稳定 → 闪退）
+try:
+    from jnius import PythonJavaClass, java_method
+
+    class BtScanReceiver(PythonJavaClass):
+        """蓝牙扫描广播接收器 — 模块级定义确保 jnius 稳定"""
+        __javainterfaces__ = ["android/content/BroadcastReceiver"]
+
+        def __init__(self):
+            super().__init__()
+            self.outer = None
+
+        def set_outer(self, outer):
+            self.outer = outer
+
+        @java_method("(Landroid/content/Context;Landroid/content/Intent;)V")
+        def onReceive(self, context, intent):
+            if self.outer is None:
+                return
+            try:
+                action = intent.getAction()
+                if action == "android.bluetooth.device.action.FOUND":
+                    dev = None
+                    try:
+                        dev = intent.getParcelableExtra("android.bluetooth.device.extra.DEVICE")
+                    except Exception:
+                        pass
+                    if dev is None:
+                        try:
+                            BluetoothDevice_cls = self.outer._autoclass("android.bluetooth.BluetoothDevice")
+                            method = intent.getClass().getMethod("getParcelableExtra",
+                                self.outer._autoclass("java.lang.String"),
+                                self.outer._autoclass("java.lang.Class"))
+                            dev = method.invoke(intent, "android.bluetooth.device.extra.DEVICE", BluetoothDevice_cls)
+                        except Exception as e2:
+                            print(f"[BT] getParcelableExtra 2-arg failed: {e2}")
+                    if dev is None:
+                        print("[BT] onReceive: device is null")
+                        return
+                    rssi = intent.getShortExtra("android.bluetooth.device.extra.RSSI", -999)
+                    try:
+                        name = dev.getName()
+                    except Exception:
+                        name = None
+                    try:
+                        addr = dev.getAddress()
+                    except Exception:
+                        addr = "(unknown)"
+                    if not name:
+                        name = "(未命名)"
+                    info = {"name": name, "address": addr, "rssi": int(rssi)}
+                    print(f"[BT] Found device: {info}")
+                    Clock.schedule_once(lambda dt, info=info: self.outer._on_found(info), 0)
+            except Exception as e:
+                print(f"[BT] ScanReceiver onReceive error: {e}")
+
+    class BtLeScanCallback(PythonJavaClass):
+        """BLE 扫描回调 — 模块级定义确保 jnius 稳定"""
+        __javainterfaces__ = ["android/bluetooth/le/ScanCallback"]
+        __javacontext__ = "app"
+
+        def __init__(self):
+            super().__init__()
+            self.outer = None
+
+        def set_outer(self, outer):
+            self.outer = outer
+
+        @java_method("(Landroid/bluetooth/le/ScanResult;)V")
+        def onScanResult(self, result):
+            if self.outer is None:
+                return
+            try:
+                dev = result.getDevice()
+                name = None
+                try:
+                    name = dev.getName()
+                except Exception:
+                    pass
+                try:
+                    addr = dev.getAddress()
+                except Exception:
+                    addr = "(unknown)"
+                if not name:
+                    name = "(未命名)"
+                rssi = result.getRssi()
+                info = {"name": name, "address": addr, "rssi": int(rssi)}
+                print(f"[BT-BLE] Found: {info}")
+                Clock.schedule_once(lambda dt, info=info: self.outer._on_found(info), 0)
+            except Exception as e:
+                print(f"[BT-BLE] onScanResult error: {e}")
+
+        @java_method("([Landroid/bluetooth/le/ScanResult;)V")
+        def onBatchScanResults(self, results):
+            pass
+
+        @java_method("(I)V")
+        def onScanFailed(self, errorCode):
+            print(f"[BT-BLE] Scan failed, error code: {errorCode}")
+
+except ImportError:
+    # jnius 不可用时（桌面端）创建空占位类
+    BtScanReceiver = None
+    BtLeScanCallback = None
+
+
 class BluetoothService:
     """蓝牙服务封装：Android走jnius原生API，桌面走模拟模式"""
 
@@ -394,34 +501,30 @@ class BluetoothService:
                     Clock.schedule_once(lambda dt, d=d: callback(d), 0)
             threading.Thread(target=_sim, daemon=True).start()
             return
-        # Android 原生扫描
+        # Android 原生扫描 — 用 Clock 在主线程调度，避免线程中调 jnius 崩溃
         try:
-            # 先确保权限已授予
             from android.permissions import check_permission, Permission
             bt_scan_ok = check_permission(Permission.BLUETOOTH_SCAN)
             bt_connect_ok = check_permission(Permission.BLUETOOTH_CONNECT)
             loc_ok = check_permission(Permission.ACCESS_FINE_LOCATION)
             if not (bt_scan_ok and bt_connect_ok and loc_ok):
                 print(f"[BT] Permissions not ready: scan={bt_scan_ok}, connect={bt_connect_ok}, loc={loc_ok}")
-                # 再次请求权限，然后延迟 3 秒再开始扫描
                 from android.permissions import request_permissions
                 request_permissions([Permission.BLUETOOTH_SCAN, Permission.BLUETOOTH_CONNECT, Permission.ACCESS_FINE_LOCATION])
-                def _delayed_scan():
-                    time.sleep(3)
-                    self._do_start_scan(callback)
-                threading.Thread(target=_delayed_scan, daemon=True).start()
+                # 用 Clock 调度延迟扫描，不用线程
+                Clock.schedule_once(lambda dt: self._do_start_scan(callback), 3.0)
                 return
             self._do_start_scan(callback)
         except Exception as e:
             print(f"[BT] scan permission error: {e}")
-            # 权限检查失败也尝试扫描
-            self._do_start_scan(callback)
+            # 权限检查失败也尝试扫描（主线程）
+            Clock.schedule_once(lambda dt: self._do_start_scan(callback), 0.5)
 
     def _do_start_scan(self, callback):
         """实际执行蓝牙扫描"""
         try:
             self.enable_bt()
-            from jnius import autoclass, PythonJavaClass, java_method
+            from jnius import autoclass
             Intent = autoclass("android.content.Intent")
             IntentFilter = autoclass("android.content.IntentFilter")
             Context = autoclass("android.content.Context")
@@ -444,54 +547,10 @@ class BluetoothService:
 
             print(f"[BT] Starting discovery... adapter={self._bt_adapter}")
 
-            # 广播接收器（必须先注册，再开始扫描）
-            class ScanReceiver(PythonJavaClass):
-                __javainterfaces__ = ["android/content/BroadcastReceiver"]
-
-                def __init__(self, outer):
-                    self.outer = outer
-                    super().__init__()
-
-                @java_method("(Landroid/content/Context;Landroid/content/Intent;)V")
-                def onReceive(self, context, intent):
-                    action = intent.getAction()
-                    if action == "android.bluetooth.device.action.FOUND":
-                        dev = None
-                        # Android 13+ getParcelableExtra(String) 返回 null
-                        # 用反射调用 2 参数版 getParcelableExtra(String, Class)
-                        try:
-                            dev = intent.getParcelableExtra("android.bluetooth.device.extra.DEVICE")
-                        except Exception:
-                            pass
-                        if dev is None:
-                            try:
-                                BluetoothDevice_cls = self.outer._autoclass("android.bluetooth.BluetoothDevice")
-                                # jnius 不直接支持 2 参数版，用反射
-                                method = intent.getClass().getMethod("getParcelableExtra", autoclass("java.lang.String"), autoclass("java.lang.Class"))
-                                dev = method.invoke(intent, "android.bluetooth.device.extra.DEVICE", BluetoothDevice_cls)
-                            except Exception as e2:
-                                print(f"[BT] getParcelableExtra 2-arg failed: {e2}")
-                        if dev is None:
-                            print("[BT] onReceive: device is null")
-                            return
-                        rssi = intent.getShortExtra("android.bluetooth.device.extra.RSSI", -999)
-                        try:
-                            name = dev.getName()
-                        except Exception:
-                            name = None
-                        try:
-                            addr = dev.getAddress()
-                        except Exception:
-                            addr = "(unknown)"
-                        if not name:
-                            name = "(未命名)"
-                        info = {"name": name, "address": addr, "rssi": int(rssi)}
-                        print(f"[BT] Found device: {info}")
-                        Clock.schedule_once(lambda dt, info=info: self.outer._on_found(info), 0)
-
-            self._scan_receiver = ScanReceiver(self)
+            # 使用模块级 ScanReceiver（不再在方法内定义，避免 jnius 崩溃）
+            self._scan_receiver = BtScanReceiver()
+            self._scan_receiver.set_outer(self)
             flt = IntentFilter("android.bluetooth.device.action.FOUND")
-            # 确保 autoclass 在回调中可用
             self._autoclass = autoclass
             # Android 14 要求 registerReceiver 指定 flag
             # 关键：ACTION_FOUND 是系统广播，必须用 RECEIVER_EXPORTED (flag=2)
@@ -518,9 +577,8 @@ class BluetoothService:
             if not result:
                 print("[BT] startDiscovery returned false, relying on BLE scanner only")
 
-            # 12秒后自动停止扫描
-            def _stop():
-                time.sleep(12)
+            # 12秒后自动停止扫描（用 Clock 在主线程停止，避免线程中调 jnius）
+            def _stop(dt):
                 try:
                     self._bt_adapter.cancelDiscovery()
                 except Exception:
@@ -533,7 +591,7 @@ class BluetoothService:
                     self._stop_ble_scan()
                 except Exception:
                     pass
-            threading.Thread(target=_stop, daemon=True).start()
+            Clock.schedule_once(_stop, 12)
         except Exception as e:
             print(f"[BT] scan error: {e}")
             traceback.print_exc()
@@ -541,9 +599,7 @@ class BluetoothService:
     def _start_ble_scan(self, callback):
         """BLE 扫描作为 startDiscovery 的备选方案"""
         try:
-            from jnius import autoclass, PythonJavaClass, java_method
-            BluetoothLeScanner = autoclass("android.bluetooth.le.BluetoothLeScanner")
-            ScanCallback = autoclass("android.bluetooth.le.ScanCallback")
+            from jnius import autoclass
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             activity = PythonActivity.mActivity
 
@@ -552,46 +608,9 @@ class BluetoothService:
                 print("[BT] No BluetoothLeScanner available")
                 return
 
-            outer = self
-
-            class LeScanCallback(PythonJavaClass):
-                __javainterfaces__ = ["android/bluetooth/le/ScanCallback"]
-                __javacontext__ = "app"
-
-                def __init__(self):
-                    super().__init__()
-
-                @java_method("(Landroid/bluetooth/le/ScanResult;)V")
-                def onScanResult(self, result):
-                    try:
-                        dev = result.getDevice()
-                        name = None
-                        try:
-                            name = dev.getName()
-                        except Exception:
-                            pass
-                        try:
-                            addr = dev.getAddress()
-                        except Exception:
-                            addr = "(unknown)"
-                        if not name:
-                            name = "(未命名)"
-                        rssi = result.getRssi()
-                        info = {"name": name, "address": addr, "rssi": int(rssi)}
-                        print(f"[BT-BLE] Found: {info}")
-                        Clock.schedule_once(lambda dt, info=info: outer._on_found(info), 0)
-                    except Exception as e:
-                        print(f"[BT-BLE] onScanResult error: {e}")
-
-                @java_method("([Landroid/bluetooth/le/ScanResult;)V")
-                def onBatchScanResults(self, results):
-                    pass
-
-                @java_method("(I)V")
-                def onScanFailed(self, errorCode):
-                    print(f"[BT-BLE] Scan failed, error code: {errorCode}")
-
-            self._ble_callback = LeScanCallback()
+            # 使用模块级 LeScanCallback
+            self._ble_callback = BtLeScanCallback()
+            self._ble_callback.set_outer(self)
             scanner.startScan(None, None, self._ble_callback)
             self._ble_scanner = scanner
             print("[BT-BLE] BLE scan started")
@@ -1282,6 +1301,7 @@ class PlayerScreen(Screen):
 
     def _saf_to_temp(self, content_uri_str):
         """将 content URI 的音频文件复制到 app 临时目录后返回路径"""
+        pfd = None
         try:
             from jnius import autoclass
             Uri = autoclass("android.net.Uri")
@@ -1290,12 +1310,16 @@ class PlayerScreen(Screen):
             resolver = activity.getContentResolver()
 
             uri = Uri.parse(content_uri_str)
-            # 用 ParcelFileDescriptor + os.fdopen：比 InputStream.read(byte[]) 更可靠
             pfd = resolver.openFileDescriptor(uri, "r")
             if pfd is None:
                 print(f"[Player] openFileDescriptor returned null for {content_uri_str}")
                 return None
-            raw_fd = pfd.getFd()
+
+            # 用 Java FileInputStream 读取，避免 os.fdopen 和 pfd.close() 双重关闭 fd
+            f_in = pfd.getFileInputStream()
+            if f_in is None:
+                # fallback: 用 openInputStream
+                f_in = resolver.openInputStream(uri)
 
             import tempfile
             ext = ".mp3"
@@ -1303,21 +1327,29 @@ class PlayerScreen(Screen):
                 if content_uri_str.lower().endswith(e[1:]):
                     ext = e
                     break
-            tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False, dir=APP_FOLDER)
-            # 用 Python os.fdopen 从 raw fd 读取，比 Java InputStream.read(byte[]) 稳定
-            with os.fdopen(raw_fd, "rb") as src:
-                while True:
-                    chunk = src.read(8192)
-                    if not chunk:
-                        break
-                    tmp.write(chunk)
-            tmp.close()
-            pfd.close()
-            return tmp.name
+            tmp_path = join(APP_FOLDER, f"_tmp_audio_{int(time.time()*1000)}{ext}")
+            with open(tmp_path, "wb") as out:
+                # 用 Java byte 数组读取
+                buf = f_in.read(8192)
+                while buf is not None and buf != -1:
+                    # jnius 返回 byte[] 时，需要用 .decode() 或直接写入
+                    try:
+                        out.write(bytes(buf))
+                    except Exception:
+                        out.write(bytearray(buf))
+                    buf = f_in.read(8192)
+            f_in.close()
+            return tmp_path
         except Exception as e:
             print(f"[Player] content URI to temp error: {e}")
             traceback.print_exc()
             return None
+        finally:
+            if pfd is not None:
+                try:
+                    pfd.close()
+                except Exception:
+                    pass
 
     def _update_progress(self, dt):
         s = self._sound
