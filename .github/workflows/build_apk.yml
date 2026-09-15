@@ -213,7 +213,31 @@ jobs:
           exit $BUILD_EXIT
         shell: bash
 
-      # -------- Step 8: 上传构建日志（失败时方便排查）--------
+      # -------- Step 8.5: 检查 AndroidManifest.xml 权限（调试用）--------
+      - name: Verify AndroidManifest permissions
+        if: always()
+        run: |
+          echo "=== Searching for AndroidManifest.xml ==="
+          find /home/runner/.buildozer -name "AndroidManifest.xml" -exec echo "Found: {}" \; 2>/dev/null || true
+          MANIFEST=$(find /home/runner/.buildozer -name "AndroidManifest.xml" -path "*/debug/*" 2>/dev/null | head -1)
+          if [ -z "$MANIFEST" ]; then
+            MANIFEST=$(find .buildozer -name "AndroidManifest.xml" 2>/dev/null | head -1)
+          fi
+          if [ -n "$MANIFEST" ]; then
+            echo "=== AndroidManifest.xml content ==="
+            cat "$MANIFEST"
+            echo ""
+            echo "=== Permissions in manifest ==="
+            grep "uses-permission" "$MANIFEST" || echo "NO PERMISSIONS FOUND!"
+          else
+            echo "WARNING: No AndroidManifest.xml found"
+          fi
+          APK=$(ls bin/*.apk 2>/dev/null | head -1)
+          if [ -n "$APK" ]; then
+            echo "=== APK found: $APK ==="
+            unzip -p bin/*.apk AndroidManifest.xml 2>/dev/null | strings | grep -i "permission\|bluetooth\|location\|media_audio" || echo "No permissions found in APK"
+          fi
+        shell: bash
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
