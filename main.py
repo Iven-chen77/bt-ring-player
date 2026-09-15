@@ -444,13 +444,27 @@ class BluetoothService:
 
             # 检查位置服务是否开启（Android 蓝牙扫描需要）
             try:
+                LocationManager = autoclass("android.location.LocationManager")
                 loc_manager = activity.getSystemService(Context.LOCATION_SERVICE)
-                if loc_manager and not loc_manager.isProviderEnabled("gps") and not loc_manager.isProviderEnabled("network"):
-                    print("[BT] Location service not enabled!")
-                    Clock.schedule_once(lambda dt: callback({"name": "请开启手机位置服务(GPS)后再扫描", "address": "", "rssi": 0}), 0)
-                    return
+                if loc_manager:
+                    gps_ok = loc_manager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+                    net_ok = loc_manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+                    if not gps_ok and not net_ok:
+                        print("[BT] Location service not enabled!")
+                        Clock.schedule_once(lambda dt: callback({"name": "请开启手机位置服务(GPS)后再扫描蓝牙", "address": "", "rssi": 0}), 0)
+                        return
             except Exception as e:
                 print(f"[BT] Location check error: {e}")
+
+            # 再次检查蓝牙扫描权限
+            try:
+                from android.permissions import check_permission, Permission
+                if not check_permission(Permission.BLUETOOTH_SCAN):
+                    print("[BT] BLUETOOTH_SCAN permission not granted!")
+                    Clock.schedule_once(lambda dt: callback({"name": "缺少蓝牙扫描权限，请到设置→应用→BTRingPlayer→权限，开启「附近设备」权限", "address": "", "rssi": 0}), 0)
+                    return
+            except Exception as e:
+                print(f"[BT] permission check error: {e}")
 
             print(f"[BT] Starting discovery... adapter={self._bt_adapter}")
 
@@ -1056,19 +1070,21 @@ class PlayerScreen(Screen):
         self.refresh_songs()
 
     def _scan_android_mediastore(self):
-        """Android: 用 MediaStore API 查询所有音频文件（不需要文件权限）"""
+        """Android: 用 MediaStore API 查询所有音频文件"""
         self.ids.song_list.clear_widgets()
         self.songs = []
         try:
             from jnius import autoclass
-            MediaStore = autoclass("android.provider.MediaStore")
+            # jnius 无法直接访问 MediaStore.Audio.Media 嵌套类
+            # 必须用 $ 语法：android.provider.MediaStore$Audio$Media
+            MediaStore_Audio_Media = autoclass("android.provider.MediaStore$Audio$Media")
             Uri = autoclass("android.net.Uri")
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             activity = PythonActivity.mActivity
             resolver = activity.getContentResolver()
 
             # 查询所有音频文件
-            audio_uri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+            audio_uri = MediaStore_Audio_Media.EXTERNAL_CONTENT_URI
             projection = [
                 "_id",
                 "_display_name",
@@ -1077,7 +1093,6 @@ class PlayerScreen(Screen):
                 "artist",
                 "duration",
             ]
-            # Android 10+ 用 _display_name，旧版用 _data
             cursor = resolver.query(audio_uri, projection, None, None, "title ASC")
             if cursor is None:
                 App.get_running_app().toast("无法访问媒体库")
