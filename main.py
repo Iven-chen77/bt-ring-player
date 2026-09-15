@@ -299,6 +299,16 @@ class BluetoothService:
                 Permission.ACCESS_FINE_LOCATION,
                 Permission.ACCESS_COARSE_LOCATION,
             ]
+            # Android 13+ 需要运行时申请 READ_MEDIA_AUDIO
+            try:
+                perms.append(Permission.READ_MEDIA_AUDIO)
+            except Exception:
+                pass
+            # Android 12 及以下需要 READ_EXTERNAL_STORAGE
+            try:
+                perms.append(Permission.READ_EXTERNAL_STORAGE)
+            except Exception:
+                pass
             try:
                 request_permissions(perms)
             except Exception:
@@ -318,7 +328,7 @@ class BluetoothService:
             print(f"[BT] Android init error: {e}")
 
     def _check_bt_permissions(self, dt):
-        """检查蓝牙权限是否已授予，未授予则再次请求"""
+        """检查蓝牙+音频权限是否已授予，未授予则再次请求"""
         try:
             from jnius import autoclass
             from android.permissions import request_permissions, Permission, check_permission
@@ -326,6 +336,12 @@ class BluetoothService:
             for p in [Permission.BLUETOOTH_SCAN, Permission.BLUETOOTH_CONNECT, Permission.ACCESS_FINE_LOCATION]:
                 if not check_permission(p):
                     perms_needed.append(p)
+            # 也检查音频权限
+            try:
+                if not check_permission(Permission.READ_MEDIA_AUDIO):
+                    perms_needed.append(Permission.READ_MEDIA_AUDIO)
+            except Exception:
+                pass
             if perms_needed:
                 print(f"[BT] Permissions not granted yet: {perms_needed}, requesting again...")
                 request_permissions(perms_needed)
@@ -450,15 +466,21 @@ class BluetoothService:
                 def onReceive(self, context, intent):
                     action = intent.getAction()
                     if action == "android.bluetooth.device.action.FOUND":
-                        # Android 13+ getParcelableExtra(String) 已废弃返回 null
-                        # 必须用 getParcelableExtra(String, Class) (API 33+)
-                        BluetoothDevice_cls = self.outer._autoclass("android.bluetooth.BluetoothDevice")
+                        # Android 13+ getParcelableExtra(String) 已废弃
+                        # 但 jnius 对 2 参数版 (String, Class) 支持不稳定
+                        # 优先用 1 参数版，fallback 到 2 参数版
+                        dev = None
                         try:
-                            dev = intent.getParcelableExtra("android.bluetooth.device.extra.DEVICE", BluetoothDevice_cls)
-                        except Exception:
                             dev = intent.getParcelableExtra("android.bluetooth.device.extra.DEVICE")
+                        except Exception:
+                            print("[BT] getParcelableExtra(1-arg) failed, trying 2-arg...")
+                            try:
+                                BluetoothDevice_cls = self.outer._autoclass("android.bluetooth.BluetoothDevice")
+                                dev = intent.getParcelableExtra("android.bluetooth.device.extra.DEVICE", BluetoothDevice_cls)
+                            except Exception as e2:
+                                print(f"[BT] getParcelableExtra(2-arg) also failed: {e2}")
                         if dev is None:
-                            print("[BT] onReceive: device is null (getParcelableExtra failed)")
+                            print("[BT] onReceive: device is null")
                             return
                         rssi = intent.getShortExtra("android.bluetooth.device.extra.RSSI", -999)
                         try:
@@ -472,6 +494,7 @@ class BluetoothService:
                         if not name:
                             name = "(未命名)"
                         info = {"name": name, "address": addr, "rssi": int(rssi)}
+                        print(f"[BT] Found device: {info}")
                         Clock.schedule_once(lambda dt, info=info: self.outer._on_found(info), 0)
 
             self._scan_receiver = ScanReceiver(self)
@@ -886,7 +909,7 @@ class MainScreen(Screen):
 
 class BTDialogContent(ScrollView):
     """蓝牙弹窗的二级界面：已配对列表 + 扫描到的设备列表"""
-    on_connect_requested = None  # 触发回调
+    on_connect_requested = ObjectProperty(None)  # Kivy Property: 支持 bind/dispatch
 
     @staticmethod
     def _apply_font(item):
@@ -974,9 +997,8 @@ class BTDialogContent(ScrollView):
         self._add_scanned(d)
 
     def _emit_connect(self, dev):
-        # 分派事件：bind 的回调需要 trigger via __self__
-        if self.on_connect_requested:
-            self.on_connect_requested(self, dev)
+        # dispatch event: 触发 bind 绑定的回调
+        self.dispatch("on_connect_requested", self, dev)
 
 
 # ================= 播放器界面 =================
@@ -1177,7 +1199,7 @@ class PlayerScreen(Screen):
         self._progress_ev = Clock.schedule_interval(self._update_progress, 0.5)
 
     def _saf_to_temp(self, content_uri_str):
-        """将 SAF content URI 的音频文件复制到 app 临时目录后返回路径"""
+        """将 content URI 的音频文件复制到 app 临时目录后返回路径"""
         try:
             from jnius import autoclass
             Uri = autoclass("android.net.Uri")
@@ -1186,10 +1208,12 @@ class PlayerScreen(Screen):
             resolver = activity.getContentResolver()
 
             uri = Uri.parse(content_uri_str)
-            is_input = resolver.openInputStream(uri)
-            if is_input is None:
-                print(f"[Player] openInputStream returned null for {content_uri_str}")
+            # 用 ParcelFileDescriptor + os.fdopen：比 InputStream.read(byte[]) 更可靠
+            pfd = resolver.openFileDescriptor(uri, "r")
+            if pfd is None:
+                print(f"[Player] openFileDescriptor returned null for {content_uri_str}")
                 return None
+            raw_fd = pfd.getFd()
 
             import tempfile
             ext = ".mp3"
@@ -1198,18 +1222,19 @@ class PlayerScreen(Screen):
                     ext = e
                     break
             tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False, dir=APP_FOLDER)
-            buf = bytearray(8192)
-            stream = is_input
-            while True:
-                n = stream.read(buf, 0, 8192)
-                if n <= 0:
-                    break
-                tmp.write(bytes(buf[:n]))
+            # 用 Python os.fdopen 从 raw fd 读取，比 Java InputStream.read(byte[]) 稳定
+            with os.fdopen(raw_fd, "rb") as src:
+                while True:
+                    chunk = src.read(8192)
+                    if not chunk:
+                        break
+                    tmp.write(chunk)
             tmp.close()
-            stream.close()
+            pfd.close()
             return tmp.name
         except Exception as e:
-            print(f"[Player] SAF to temp error: {e}")
+            print(f"[Player] content URI to temp error: {e}")
+            traceback.print_exc()
             return None
 
     def _update_progress(self, dt):
