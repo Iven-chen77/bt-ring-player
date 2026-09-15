@@ -27,15 +27,16 @@ version = 1.0
 # 注意：sdl2_* 这些是 p4a 内置 recipe 名，不要放在 requirements 里（会报错），kivy 会自动依赖
 requirements = python3,kivy==2.3.1,cython==3.0.11,kivymd==1.2.0,pillow,plyer,android
 
-# (str) 预设的 Android API 级别
-# 33 = Android 13，34 = Android 14（推荐 33，兼容性更稳）
-android.api = 33
+# (str) 预设的 Android API 级别（targetSdk）
+# 34 = Android 14：Realme 12 等新机型必须用 34，否则 BLUETOOTH_SCAN/READ_MEDIA_AUDIO
+# 等运行时权限不会弹出请求，系统设置里也不显示「附近设备」权限
+android.api = 34
 
 # (int) 最低支持的 Android API 级别 (Android 7.0+)
 android.minapi = 24
 
-# (int) Android SDK build-tools 版本（和 NDK/SDK 配套）
-android.buildtools = 33.0.3
+# (int) Android SDK build-tools 版本（和 API 34 配套）
+android.buildtools = 34.0.0
 
 # (str) Android NDK 版本（p4a 最低要求 r25）
 android.ndk = 25b

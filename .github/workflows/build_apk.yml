@@ -120,9 +120,9 @@ jobs:
             ~/.cache/pip
             ~/.buildozer
             ~/.gradle
-          key: buildozer-cache-v8-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-cache-v9-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-cache-v8-${{ runner.os }}-
+            buildozer-cache-v9-${{ runner.os }}-
 
       # -------- Step 5: 安装 Python 构建工具 --------
       - name: Install buildozer / cython
