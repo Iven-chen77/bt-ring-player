@@ -494,19 +494,29 @@ class BluetoothService:
             # 确保 autoclass 在回调中可用
             self._autoclass = autoclass
             # Android 14 要求 registerReceiver 指定 flag
+            # 关键：ACTION_FOUND 是系统广播，必须用 RECEIVER_EXPORTED (flag=2)
+            # 用 RECEIVER_NOT_EXPORTED (flag=4) 会阻止系统广播 → 扫不到设备！
             try:
-                activity.registerReceiver(self._scan_receiver, flt, 4)
-            except Exception:
-                activity.registerReceiver(self._scan_receiver, flt)
+                activity.registerReceiver(self._scan_receiver, flt, 2)
+                print("[BT] Receiver registered with RECEIVER_EXPORTED (flag=2)")
+            except Exception as e_reg:
+                print(f"[BT] registerReceiver with flag failed: {e_reg}, trying without flag")
+                try:
+                    activity.registerReceiver(self._scan_receiver, flt)
+                    print("[BT] Receiver registered without flag")
+                except Exception as e_reg2:
+                    print(f"[BT] registerReceiver completely failed: {e_reg2}")
 
             # 先注册广播，再开始扫描
             result = self._bt_adapter.startDiscovery()
             print(f"[BT] startDiscovery() returned: {result}")
 
+            # 同时启动 BLE 扫描（双引擎扫描，最大化发现设备概率）
+            print("[BT] Also starting BLE scan in parallel...")
+            self._start_ble_scan(callback)
+
             if not result:
-                # startDiscovery 失败，尝试用 BLE scanner
-                print("[BT] startDiscovery failed, trying BluetoothLeScanner...")
-                self._start_ble_scan(callback)
+                print("[BT] startDiscovery returned false, relying on BLE scanner only")
 
             # 12秒后自动停止扫描
             def _stop():
