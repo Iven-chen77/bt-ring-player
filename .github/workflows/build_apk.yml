@@ -213,29 +213,34 @@ jobs:
           exit $BUILD_EXIT
         shell: bash
 
-      # -------- Step 8.5: 检查 AndroidManifest.xml 权限（调试用）--------
-      - name: Verify AndroidManifest permissions
+      # -------- Step 8.5: 检查权限是否正确写入 manifest --------
+      - name: Check permissions in build log and APK
         if: always()
         run: |
-          echo "=== Searching for AndroidManifest.xml ==="
-          find /home/runner/.buildozer -name "AndroidManifest.xml" -exec echo "Found: {}" \; 2>/dev/null || true
-          MANIFEST=$(find /home/runner/.buildozer -name "AndroidManifest.xml" -path "*/debug/*" 2>/dev/null | head -1)
-          if [ -z "$MANIFEST" ]; then
-            MANIFEST=$(find .buildozer -name "AndroidManifest.xml" 2>/dev/null | head -1)
-          fi
-          if [ -n "$MANIFEST" ]; then
-            echo "=== AndroidManifest.xml content ==="
-            cat "$MANIFEST"
-            echo ""
-            echo "=== Permissions in manifest ==="
-            grep "uses-permission" "$MANIFEST" || echo "NO PERMISSIONS FOUND!"
-          else
-            echo "WARNING: No AndroidManifest.xml found"
-          fi
+          echo "=== 1. Check p4a permission flags in build log ==="
+          grep -i "permission" build_apk.log 2>/dev/null | head -30 || echo "No permission lines in log"
+          echo ""
+          echo "=== 2. Check AndroidManifest.xml in build dir ==="
+          find /home/runner/.buildozer -name "AndroidManifest.xml" 2>/dev/null | while read f; do
+            echo "--- $f ---"
+            grep -i "permission" "$f" 2>/dev/null || echo "(no permissions in this file)"
+          done
+          echo ""
+          echo "=== 3. Check APK manifest ==="
           APK=$(ls bin/*.apk 2>/dev/null | head -1)
           if [ -n "$APK" ]; then
-            echo "=== APK found: $APK ==="
-            unzip -p bin/*.apk AndroidManifest.xml 2>/dev/null | strings | grep -i "permission\|bluetooth\|location\|media_audio" || echo "No permissions found in APK"
+            echo "APK: $APK"
+            # 用 aapt dump permissions 检查
+            AAPT=$(find /home/runner/.buildozer -name "aapt" -type f 2>/dev/null | head -1)
+            if [ -n "$AAPT" ]; then
+              echo "Using aapt: $AAPT"
+              "$AAPT" dump permissions "$APK" 2>/dev/null || echo "aapt dump failed"
+            else
+              echo "No aapt found, trying unzip + strings"
+              unzip -p "$APK" AndroidManifest.xml 2>/dev/null | strings | grep -i "permission\|bluetooth\|location\|media" || echo "No permissions found"
+            fi
+          else
+            echo "No APK found in bin/"
           fi
         shell: bash
       - name: Upload build log

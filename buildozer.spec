@@ -95,6 +95,9 @@ android.enableJetifier = True
 # 这里添加蓝牙相关的 action 可选
 android.manifest_placeholders =
 
+# (str) 自定义 AndroidManifest 模板文件路径（确保权限被写入）
+android.manifest = %(source.dir)s/templates/AndroidManifest.tmpl.xml
+
 # (bool) 每次构建前自动执行 buildozer android clean
 # 建议首次构建设为 0，遇到依赖问题再手动 clean
 # android.apptheme = @android:style/Theme.Material.Light.NoActionBar
