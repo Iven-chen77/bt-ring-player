@@ -608,14 +608,27 @@ class BluetoothService:
                 print("[BT] No BluetoothLeScanner available")
                 return
 
+            # 创建 ScanSettings: SCAN_MODE_LOW_LATENCY 最快发现设备
+            ScanSettings = autoclass("android.bluetooth.le.ScanSettings")
+            settings_builder = ScanSettings.Builder()
+            settings_builder.setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            settings = settings_builder.build()
+
             # 使用模块级 LeScanCallback
             self._ble_callback = BtLeScanCallback()
             self._ble_callback.set_outer(self)
-            scanner.startScan(None, None, self._ble_callback)
+            scanner.startScan(None, settings, self._ble_callback)
             self._ble_scanner = scanner
-            print("[BT-BLE] BLE scan started")
+            print("[BT-BLE] BLE scan started with LOW_LATENCY settings")
         except Exception as e:
             print(f"[BT-BLE] Error: {e}")
+            # 最后 fallback: 无参数版 startScan
+            try:
+                if scanner and self._ble_callback:
+                    scanner.startScan(None, None, self._ble_callback)
+                    print("[BT-BLE] BLE scan started (fallback, no settings)")
+            except Exception as e2:
+                print(f"[BT-BLE] Fallback also failed: {e2}")
 
     def _stop_ble_scan(self):
         """停止 BLE 扫描"""
@@ -642,39 +655,97 @@ class BluetoothService:
         self._on_connect_error = on_error
         self.connected_device = device
         if platform != "android":
-            # 桌面模拟：1秒后连接成功
             def _sim():
                 time.sleep(1)
                 self.connected = True
                 Clock.schedule_once(lambda dt: on_success and on_success(device), 0)
             threading.Thread(target=_sim, daemon=True).start()
             return
-        threading.Thread(target=self._connect_thread, args=(device,), daemon=True).start()
+        # 在主线程执行 jnius 调用，避免线程中 jnius 崩溃
+        Clock.schedule_once(lambda dt: self._connect_step1(device), 0.1)
 
-    def _connect_thread(self, device):
+    def _connect_step1(self, device):
+        """Step 1: 检查 adapter + 获取远程设备"""
         try:
+            if not self._bt_adapter:
+                print("[BT] connect: adapter is None")
+                self._safe_error("蓝牙未初始化")
+                return
             self.enable_bt()
-            addr = device["address"]
+            addr = device.get("address", "")
+            if not addr:
+                self._safe_error("设备地址为空")
+                return
+            print(f"[BT] connect: getting remote device {addr}")
             dev = self._bt_adapter.getRemoteDevice(addr)
-            # 若未配对，先发起配对
-            if dev.getBondState() != self._BluetoothDevice.BOND_BONDED:
+            if dev is None:
+                self._safe_error("无法获取远程设备")
+                return
+            self._connect_dev = dev
+            # 下一步：检查配对状态
+            Clock.schedule_once(lambda dt: self._connect_step2(dev), 0.1)
+        except Exception as e:
+            print(f"[BT] connect step1 error: {e}")
+            self._safe_error(str(e))
+
+    def _connect_step2(self, dev):
+        """Step 2: 检查配对状态，如未配对则配对"""
+        try:
+            bonded = self._BluetoothDevice.BOND_BONDED
+            if dev.getBondState() != bonded:
+                print("[BT] not bonded, creating bond...")
                 dev.createBond()
-                for _ in range(20):  # 最多等10秒配对
-                    time.sleep(0.5)
-                    if dev.getBondState() == self._BluetoothDevice.BOND_BONDED:
-                        break
+                # 用 Clock 轮询配对状态
+                self._bond_wait_count = 0
+                Clock.schedule_once(lambda dt: self._connect_wait_bond(dev), 1.0)
+            else:
+                print("[BT] already bonded, creating socket...")
+                Clock.schedule_once(lambda dt: self._connect_step3(dev), 0.1)
+        except Exception as e:
+            print(f"[BT] connect step2 error: {e}")
+            self._safe_error(str(e))
+
+    def _connect_wait_bond(self, dev):
+        """等待配对完成"""
+        try:
+            self._bond_wait_count += 1
+            if dev.getBondState() == self._BluetoothDevice.BOND_BONDED:
+                print("[BT] bond completed")
+                Clock.schedule_once(lambda dt: self._connect_step3(dev), 0.1)
+            elif self._bond_wait_count > 10:
+                print("[BT] bond timeout")
+                self._safe_error("配对超时")
+            else:
+                Clock.schedule_once(lambda dt: self._connect_wait_bond(dev), 1.0)
+        except Exception as e:
+            print(f"[BT] bond wait error: {e}")
+            self._safe_error(str(e))
+
+    def _connect_step3(self, dev):
+        """Step 3: 创建 socket + 连接"""
+        try:
             self._bt_adapter.cancelDiscovery()
+            print("[BT] creating RFCOMM socket...")
             sock = dev.createRfcommSocketToServiceRecord(self._spp_uuid)
+            if sock is None:
+                self._safe_error("无法创建 Socket")
+                return
+            print("[BT] connecting socket...")
             sock.connect()
             self._socket = sock
             self.connected = True
-            Clock.schedule_once(lambda dt: self.on_connected and self.on_connected(device), 0)
-            # 启动接收监听线程
+            print(f"[BT] connected to {self.connected_device.get('name', '?')}")
+            Clock.schedule_once(lambda dt: self.on_connected and self.on_connected(self.connected_device), 0)
+            # 接收线程只做读取（socket 已连接，不会 jnius 初始化）
             threading.Thread(target=self._recv_loop, daemon=True).start()
         except Exception as e:
-            print(f"[BT] connect error: {e}")
+            print(f"[BT] connect step3 error: {e}")
             self.connected = False
-            Clock.schedule_once(lambda dt: self._on_connect_error and self._on_connect_error(str(e)), 0)
+            self._safe_error(str(e))
+
+    def _safe_error(self, msg):
+        """安全地调用错误回调"""
+        Clock.schedule_once(lambda dt: self._on_connect_error and self._on_connect_error(msg), 0)
 
     def _recv_loop(self):
         try:
@@ -1315,13 +1386,8 @@ class PlayerScreen(Screen):
                 print(f"[Player] openFileDescriptor returned null for {content_uri_str}")
                 return None
 
-            # 用 Java FileInputStream 读取，避免 os.fdopen 和 pfd.close() 双重关闭 fd
-            f_in = pfd.getFileInputStream()
-            if f_in is None:
-                # fallback: 用 openInputStream
-                f_in = resolver.openInputStream(uri)
-
-            import tempfile
+            # 用 os.read(fd) 读 raw fd — 不接管 fd 所有权，不会双重关闭
+            raw_fd = pfd.getFd()
             ext = ".mp3"
             for e in AUDIO_EXTS:
                 if content_uri_str.lower().endswith(e[1:]):
@@ -1329,16 +1395,12 @@ class PlayerScreen(Screen):
                     break
             tmp_path = join(APP_FOLDER, f"_tmp_audio_{int(time.time()*1000)}{ext}")
             with open(tmp_path, "wb") as out:
-                # 用 Java byte 数组读取
-                buf = f_in.read(8192)
-                while buf is not None and buf != -1:
-                    # jnius 返回 byte[] 时，需要用 .decode() 或直接写入
-                    try:
-                        out.write(bytes(buf))
-                    except Exception:
-                        out.write(bytearray(buf))
-                    buf = f_in.read(8192)
-            f_in.close()
+                while True:
+                    chunk = os.read(raw_fd, 65536)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            print(f"[Player] Copied to: {tmp_path}")
             return tmp_path
         except Exception as e:
             print(f"[Player] content URI to temp error: {e}")
