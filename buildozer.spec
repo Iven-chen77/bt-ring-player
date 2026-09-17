@@ -30,7 +30,8 @@ requirements = python3,kivy==2.3.1,cython==3.0.11,kivymd==1.2.0,pillow,plyer,and
 # (str) 预设的 Android API 级别（targetSdk）
 # 34 = Android 14：Realme 12 等新机型必须用 34，否则 BLUETOOTH_SCAN/READ_MEDIA_AUDIO
 # 等运行时权限不会弹出请求，系统设置里也不显示「附近设备」权限
-android.api = 34
+android.target_sdk_version = 36
+android.api = 36
 
 # (int) 最低支持的 Android API 级别 (Android 7.0+)
 android.minapi = 24
