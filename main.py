@@ -736,6 +736,23 @@ class BluetoothService:
             print(f"[BT] location check error: {e}")
             return None
 
+    def request_location(self, status_cb=None):
+        """打开系统定位设置页。
+        部分国产 ROM（realme/ColorOS 等）即使 Android 12+ 也要求打开系统定位开关，
+        经典蓝牙 startDiscovery() 才会返回设备。"""
+        try:
+            from jnius import autoclass
+            Intent = autoclass("android.content.Intent")
+            Settings = autoclass("android.provider.Settings")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+            activity.startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+            print("[BT] 已打开定位设置页")
+            return True
+        except Exception as e:
+            print(f"[BT] request location error: {e}")
+            return False
+
     def _report(self, text, status_cb=None):
         """把诊断信息打印到日志，并（可选）回显到界面"""
         print(f"[BT] {text}")
@@ -820,7 +837,9 @@ class BluetoothService:
                 return
             self._scan_retry = 0
             if self.location_report() is False:
-                self._report("提醒：系统定位开关未打开，部分机型会因此扫不到设备", self.on_status)
+                self._report("系统定位未打开，已为你跳转定位设置页（realme 等机型必须开定位才能扫到设备）",
+                             self.on_status)
+                self.request_location(status_cb=self.on_status)
             self._do_start_scan(callback)
         except Exception as e:
             print(f"[BT] prepare scan error: {e}")
@@ -957,8 +976,10 @@ class BluetoothService:
                 Clock.schedule_once(lambda dt: on_success and on_success(device), 0)
             threading.Thread(target=_sim, daemon=True).start()
             return
-        # 在主线程执行 jnius 调用，避免线程中 jnius 崩溃
-        Clock.schedule_once(lambda dt: self._connect_step1(device), 0.1)
+        # 连接需要 BLUETOOTH_CONNECT，先确认权限（已授权则直接继续）
+        self.ensure_permissions(
+            on_done=lambda: Clock.schedule_once(lambda dt: self._connect_step1(device), 0.1)
+        )
 
     def _connect_step1(self, device):
         """Step 1: 检查 adapter + 获取远程设备"""
@@ -1018,7 +1039,9 @@ class BluetoothService:
             self._safe_error(str(e))
 
     def _connect_step3(self, dev):
-        """Step 3: 创建 socket + 连接"""
+        """Step 3: 创建 socket + 连接。
+        注意：BluetoothSocket.connect() 是阻塞调用，必须放到后台线程执行，
+        否则主线程被阻塞会触发 ANR 直接闪退。"""
         try:
             self._bt_adapter.cancelDiscovery()
             print("[BT] creating RFCOMM socket...")
@@ -1026,14 +1049,31 @@ class BluetoothService:
             if sock is None:
                 self._safe_error("无法创建 Socket")
                 return
-            print("[BT] connecting socket...")
-            sock.connect()
             self._socket = sock
-            self.connected = True
-            print(f"[BT] connected to {self.connected_device.get('name', '?')}")
-            Clock.schedule_once(lambda dt: self.on_connected and self.on_connected(self.connected_device), 0)
-            # 接收线程只做读取（socket 已连接，不会 jnius 初始化）
-            threading.Thread(target=self._recv_loop, daemon=True).start()
+
+            def _do_connect():
+                try:
+                    print("[BT] connecting socket (background thread)...")
+                    sock.connect()
+                    self.connected = True
+                    print(f"[BT] connected to {self.connected_device.get('name', '?')}")
+
+                    def _on_ok(dt):
+                        if self.on_connected:
+                            self.on_connected(self.connected_device)
+                        threading.Thread(target=self._recv_loop, daemon=True).start()
+                    Clock.schedule_once(_on_ok, 0)
+                except Exception as e:
+                    print(f"[BT] connect error: {e}")
+                    self.connected = False
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    self._socket = None
+                    Clock.schedule_once(lambda dt, e=e: self._safe_error(str(e)), 0)
+
+            threading.Thread(target=_do_connect, daemon=True).start()
         except Exception as e:
             print(f"[BT] connect step3 error: {e}")
             self.connected = False
