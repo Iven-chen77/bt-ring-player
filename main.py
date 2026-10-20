@@ -927,7 +927,12 @@ class BluetoothService:
                     self._report("蓝牙未开启，请手动打开蓝牙后点「重新扫描」", self.on_status)
                 return
             self._scan_retry = 0
-            if self.location_report() is False:
+            loc = self.location_report()
+            ok, missing = self.permission_report()
+            self._report(f"环境检查: sdk={self._sdk_int} 权限={'已授予' if ok else '缺失:' + ','.join(missing)} "
+                         f"蓝牙=开 定位={'开' if loc else ('关' if loc is False else '未知')}",
+                         self.on_status)
+            if loc is False:
                 self._report("系统定位未打开，已为你跳转定位设置页（realme 等机型必须开定位才能扫到设备）",
                              self.on_status)
                 self.request_location(status_cb=self.on_status)
@@ -1242,7 +1247,8 @@ class BluetoothService:
             self._safe_error(f"[step3] {jni_detail(e)}")
 
     def _safe_error(self, msg):
-        """安全地调用错误回调"""
+        """安全地调用错误回调（同时写入 bt_debug.log，方便事后排查）"""
+        self._report(f"连接失败: {msg}")
         Clock.schedule_once(lambda dt: self._on_connect_error and self._on_connect_error(msg), 0)
 
     def _recv_loop(self):
@@ -1665,6 +1671,13 @@ class BTDialogContent(ScrollView):
         )
         self._apply_font(self._rescan_item)
         self._box.add_widget(self._rescan_item, index=1)
+        # 诊断日志入口（日志在 App 私有目录，文件管理器看不到，必须 App 内查看）
+        self._log_item = OneLineListItem(
+            text="📄 查看诊断日志",
+            on_release=lambda x: self._show_logs(),
+        )
+        self._apply_font(self._log_item)
+        self._box.add_widget(self._log_item, index=1)
         self._found_count = 0
         # 填充已配对
         for d in BT.get_paired_devices():
@@ -1733,13 +1746,72 @@ class BTDialogContent(ScrollView):
         # dispatch event: 触发 bind 绑定的回调
         try:
             self.dispatch("on_connect_requested", self, dev)
-        except Exception:
+        except Exception as e:
             print("[BT-UI] emit connect EXCEPTION:")
             traceback.print_exc()
             try:
-                App.get_running_app().toast("发起连接失败，详情见 crash.log", error=True)
+                with open(CRASH_LOG, "a", encoding="utf-8") as f:
+                    f.write(f"\n[{time.strftime('%H:%M:%S')}] emit_connect EXCEPTION\n")
+                    traceback.print_exc(file=f)
             except Exception:
                 pass
+            try:
+                App.get_running_app().toast(f"发起连接失败: {jni_detail(e)}", error=True)
+            except Exception:
+                pass
+
+    def _show_logs(self):
+        """在 App 内查看诊断日志。
+        bt_debug.log / crash.log 都写在 App 私有目录（/data/data/包名/files/），
+        普通文件管理器无权访问，所以必须在 App 里提供查看入口。"""
+        texts = []
+        for path, label in ((BT_DEBUG_LOG, "bt_debug.log（蓝牙诊断）"),
+                            (CRASH_LOG, "crash.log（崩溃记录）")):
+            texts.append(f"===== {label} =====")
+            try:
+                if exists(path):
+                    with open(path, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                    texts.append(content[-8000:] if len(content) > 8000 else content)
+                else:
+                    texts.append("(暂无内容)")
+            except Exception as e:
+                texts.append(f"(读取失败: {e})")
+        full = "\n".join(texts)
+
+        scroll = ScrollView(size_hint_y=None, height="380dp", do_scroll_x=False)
+        lbl = MDLabel(text=full, size_hint_y=None, valign="top",
+                      font_name=APP_FONT_NAME, font_size="12sp")
+        scroll.add_widget(lbl)
+
+        def _fit(*a):
+            try:
+                lbl.text_size = (max(scroll.width - 12, 100), None)
+                lbl.texture_update()
+                lbl.height = max(lbl.texture_size[1], scroll.height)
+            except Exception:
+                pass
+
+        copy_btn = MDFlatButton(text="复制全部",
+                                on_release=lambda x: self._copy_logs(full))
+        close_btn = MDFlatButton(text="关闭", on_release=lambda x: dlg.dismiss())
+        for b in (copy_btn, close_btn):
+            try:
+                b.font_name = APP_FONT_NAME
+            except Exception:
+                pass
+        dlg = MDDialog(title="诊断日志", type="custom",
+                       content_cls=scroll, buttons=[copy_btn, close_btn])
+        dlg.open()
+        Clock.schedule_once(_fit, 0.1)
+
+    def _copy_logs(self, text):
+        try:
+            from kivy.core.clipboard import Clipboard
+            Clipboard.copy(text)
+            App.get_running_app().toast("日志已复制，可粘贴发送")
+        except Exception as e:
+            print(f"[BT-UI] copy error: {e}")
 
 
 # ================= 播放器界面 =================
