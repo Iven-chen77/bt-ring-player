@@ -368,6 +368,234 @@ except ImportError:
     BtLeScanCallback = None
 
 
+# ================= 音频播放后端 =================
+# 背景：Kivy 的 SoundLoader 在 Android 上走 SDL2_mixer，p4a 打包后一般不带 MP3 解码器，
+# 表现为 SoundLoader.load() 返回 None → 手机上 MP3 打不开、提示"无法播放此格式"。
+# 因此 Android 平台改用系统原生 android.media.MediaPlayer：
+#   - 原生支持 mp3 / aac / m4a / flac / ogg / wav 等格式
+#   - 可直接播放 MediaStore 的 content:// URI，无需先拷贝成临时文件
+# 桌面端仍用 SoundLoader，两套实现暴露同一组方法：load/play/pause/stop/release/pos/length
+
+try:
+    from jnius import PythonJavaClass, java_method
+
+    class MediaPlayerCompleteListener(PythonJavaClass):
+        """MediaPlayer 播放结束回调（模块级定义保证 jnius 稳定）"""
+        __javainterfaces__ = ["android/media/MediaPlayer$OnCompletionListener"]
+
+        def __init__(self):
+            super().__init__()
+            self.outer = None
+
+        @java_method("(Landroid/media/MediaPlayer;)V")
+        def onCompletion(self, mp):
+            if self.outer is not None:
+                self.outer._on_mp_complete()
+
+    class MediaPlayerErrorListener(PythonJavaClass):
+        """MediaPlayer 播放出错回调"""
+        __javainterfaces__ = ["android/media/MediaPlayer$OnErrorListener"]
+
+        def __init__(self):
+            super().__init__()
+            self.outer = None
+
+        @java_method("(Landroid/media/MediaPlayer;II)Z")
+        def onError(self, mp, what, extra):
+            if self.outer is not None:
+                self.outer._on_mp_error(what, extra)
+            return False
+except ImportError:
+    MediaPlayerCompleteListener = None
+    MediaPlayerErrorListener = None
+
+
+class KivySoundPlayer:
+    """桌面端播放器：基于 Kivy SoundLoader"""
+
+    backend = "kivy"
+
+    def __init__(self, on_complete=None, on_error=None):
+        self._sound = None
+        self._on_complete = on_complete
+        self._on_error = on_error
+        self.length = 0
+
+    def load(self, src):
+        self.release()
+        try:
+            sound = SoundLoader.load(src)
+        except Exception as e:
+            print(f"[Player] SoundLoader error: {e}")
+            sound = None
+        if not sound:
+            return False
+        self._sound = sound
+        try:
+            sound.bind(on_stop=lambda *a: self._on_complete and self._on_complete())
+        except Exception:
+            pass
+        self.length = sound.length or 0
+        return True
+
+    def play(self):
+        if self._sound:
+            self._sound.play()
+
+    def pause(self):
+        # SoundLoader 没有 pause，用 stop 近似（位置会回退，仅桌面兜底用）
+        if self._sound:
+            self._sound.stop()
+
+    def stop(self):
+        if self._sound:
+            self._sound.stop()
+
+    def release(self):
+        if self._sound:
+            try:
+                self._sound.stop()
+                self._sound.unload()
+            except Exception:
+                pass
+        self._sound = None
+        self.length = 0
+
+    @property
+    def pos(self):
+        s = self._sound
+        if not s:
+            return 0
+        try:
+            if hasattr(s, "get_pos") and s.get_pos():
+                return s.get_pos()
+            if hasattr(s, "position"):
+                return s.position
+        except Exception:
+            pass
+        return 0
+
+
+class AndroidMediaPlayer:
+    """Android 端播放器：android.media.MediaPlayer
+
+    用系统原生解码器，支持 content:// URI 直接播放（MediaStore 音频），也支持本地文件路径。
+    """
+
+    backend = "mediaplayer"
+
+    def __init__(self, on_complete=None, on_error=None):
+        self._mp = None
+        self._complete_lsn = None
+        self._error_lsn = None
+        self._on_complete = on_complete
+        self._on_error = on_error
+        self.length = 0
+
+    # ---- Java 线程回调 → 切回 Kivy 主线程 ----
+    def _on_mp_complete(self):
+        cb = self._on_complete
+        if cb:
+            Clock.schedule_once(lambda dt: cb(), 0)
+
+    def _on_mp_error(self, what, extra):
+        print(f"[Player] MediaPlayer onError what={what} extra={extra}")
+        cb = self._on_error
+        if cb:
+            Clock.schedule_once(lambda dt: cb(f"播放出错 (what={what}, extra={extra})"), 0)
+
+    def load(self, src):
+        self.release()
+        mp = None
+        try:
+            from jnius import autoclass
+            MediaPlayer = autoclass("android.media.MediaPlayer")
+            mp = MediaPlayer()
+            if MediaPlayerCompleteListener is not None:
+                self._complete_lsn = MediaPlayerCompleteListener()
+                self._complete_lsn.outer = self
+                mp.setOnCompletionListener(self._complete_lsn)
+                self._error_lsn = MediaPlayerErrorListener()
+                self._error_lsn.outer = self
+                mp.setOnErrorListener(self._error_lsn)
+
+            if src.startswith("content://"):
+                Uri = autoclass("android.net.Uri")
+                PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                activity = PythonActivity.mActivity
+                mp.setDataSource(activity, Uri.parse(src))
+            else:
+                mp.setDataSource(src)
+
+            mp.prepare()
+            dur = mp.getDuration()
+            self.length = (dur / 1000.0) if dur and dur > 0 else 0
+            self._mp = mp
+            print(f"[Player] MediaPlayer ready: {src} (length={self.length:.1f}s)")
+            return True
+        except Exception as e:
+            print(f"[Player] MediaPlayer load failed: {e}")
+            traceback.print_exc()
+            if mp is not None:
+                try:
+                    mp.release()
+                except Exception:
+                    pass
+            self._mp = None
+            return False
+
+    def play(self):
+        if self._mp:
+            try:
+                self._mp.start()
+            except Exception as e:
+                print(f"[Player] MediaPlayer start error: {e}")
+
+    def pause(self):
+        if self._mp:
+            try:
+                self._mp.pause()
+            except Exception:
+                pass
+
+    def stop(self):
+        if self._mp:
+            try:
+                self._mp.stop()
+            except Exception:
+                pass
+
+    def release(self):
+        if self._mp:
+            try:
+                self._mp.reset()
+            except Exception:
+                pass
+            try:
+                self._mp.release()
+            except Exception:
+                pass
+        self._mp = None
+        self.length = 0
+
+    @property
+    def pos(self):
+        if not self._mp:
+            return 0
+        try:
+            p = self._mp.getCurrentPosition() / 1000.0
+            return p if p > 0 else 0
+        except Exception:
+            return 0
+
+
+def create_audio_player(on_complete=None, on_error=None):
+    """按平台创建播放器：Android 用原生 MediaPlayer，其余用 SoundLoader"""
+    if platform == "android" and MediaPlayerCompleteListener is not None:
+        return AndroidMediaPlayer(on_complete=on_complete, on_error=on_error)
+    return KivySoundPlayer(on_complete=on_complete, on_error=on_error)
+
+
 class BluetoothService:
     """蓝牙服务封装：Android走jnius原生API，桌面走模拟模式"""
 
@@ -396,31 +624,6 @@ class BluetoothService:
     def _init_android(self):
         try:
             from jnius import autoclass, cast
-            from android.permissions import request_permissions, Permission
-            # 动态申请权限
-            perms = [
-                Permission.BLUETOOTH,
-                Permission.BLUETOOTH_ADMIN,
-                Permission.BLUETOOTH_CONNECT,
-                Permission.BLUETOOTH_SCAN,
-                Permission.ACCESS_FINE_LOCATION,
-                Permission.ACCESS_COARSE_LOCATION,
-            ]
-            # Android 13+ 需要运行时申请 READ_MEDIA_AUDIO
-            try:
-                perms.append(Permission.READ_MEDIA_AUDIO)
-            except Exception:
-                pass
-            # Android 12 及以下需要 READ_EXTERNAL_STORAGE
-            try:
-                perms.append(Permission.READ_EXTERNAL_STORAGE)
-            except Exception:
-                pass
-            try:
-                request_permissions(perms)
-            except Exception:
-                pass
-
             BluetoothAdapter = autoclass("android.bluetooth.BluetoothAdapter")
             self._bt_adapter = BluetoothAdapter.getDefaultAdapter()
             self._BluetoothDevice = autoclass("android.bluetooth.BluetoothDevice")
@@ -429,34 +632,119 @@ class BluetoothService:
             self._spp_uuid = self._UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
             self._cast = cast
             self._permissions_granted = False
-            # 延迟检查权限是否已授予
-            Clock.schedule_once(self._check_bt_permissions, 2.0)
+            self.last_error = ""
+            self.on_status = None
+            # Android 12(API 31) 起扫描用 BLUETOOTH_SCAN / BLUETOOTH_CONNECT 运行时权限；
+            # 更低版本靠 ACCESS_FINE_LOCATION，且必须打开系统定位开关才扫得到设备
+            try:
+                self._sdk_int = autoclass("android.os.Build$VERSION").SDK_INT
+            except Exception:
+                self._sdk_int = 0
+            print(f"[BT] Android init done, sdk={self._sdk_int}")
         except Exception as e:
             print(f"[BT] Android init error: {e}")
 
-    def _check_bt_permissions(self, dt):
-        """检查蓝牙+音频权限是否已授予，未授予则再次请求"""
+    # -------- 权限 & 开关状态（带诊断信息） --------
+    def _required_perms(self):
+        """按系统版本返回扫描真正需要的运行时权限"""
         try:
-            from jnius import autoclass
-            from android.permissions import request_permissions, Permission, check_permission
-            perms_needed = []
-            for p in [Permission.BLUETOOTH_SCAN, Permission.BLUETOOTH_CONNECT, Permission.ACCESS_FINE_LOCATION]:
-                if not check_permission(p):
-                    perms_needed.append(p)
-            # 也检查音频权限
+            from android.permissions import Permission
+        except Exception:
+            return []
+        perms = []
+        names = ("BLUETOOTH_SCAN", "BLUETOOTH_CONNECT") if getattr(self, "_sdk_int", 0) >= 31 \
+            else ("ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION")
+        for name in names:
             try:
-                if not check_permission(Permission.READ_MEDIA_AUDIO):
-                    perms_needed.append(Permission.READ_MEDIA_AUDIO)
+                perms.append(getattr(Permission, name))
             except Exception:
                 pass
-            if perms_needed:
-                print(f"[BT] Permissions not granted yet: {perms_needed}, requesting again...")
-                request_permissions(perms_needed)
-            else:
-                self._permissions_granted = True
-                print("[BT] All permissions granted")
+        return perms
+
+    def permission_report(self):
+        """返回 (是否已全部授予, 未授予权限名列表)"""
+        try:
+            from android.permissions import check_permission
+        except Exception:
+            return True, []
+        missing = []
+        for p in self._required_perms():
+            try:
+                if not check_permission(p):
+                    missing.append(str(p).split(".")[-1])
+            except Exception:
+                pass
+        return (len(missing) == 0), missing
+
+    def ensure_permissions(self, on_done, status_cb=None):
+        """申请（或重新申请）蓝牙权限，授权成功后回调 on_done()"""
+        ok, missing = self.permission_report()
+        if ok:
+            on_done()
+            return
+        self._report("等待授权: " + ", ".join(missing), status_cb)
+        try:
+            from android.permissions import request_permissions
+
+            def _cb(permissions, grants):
+                ok2, missing2 = self.permission_report()
+                print(f"[BT] 授权结果 ok={ok2} missing={missing2}")
+                if ok2:
+                    self._report("权限已授予", status_cb)
+                    Clock.schedule_once(lambda dt: on_done(), 0.2)
+                else:
+                    self._report("权限被拒绝: " + ", ".join(missing2) + "（请到系统设置里手动允许）", status_cb)
+            request_permissions(self._required_perms(), _cb)
         except Exception as e:
-            print(f"[BT] Permission check error: {e}")
+            print(f"[BT] request_permissions error: {e}")
+            Clock.schedule_once(lambda dt: on_done(), 0.5)
+
+    def is_bt_enabled(self):
+        try:
+            return bool(self._bt_adapter and self._bt_adapter.isEnabled())
+        except Exception as e:
+            print(f"[BT] isEnabled error: {e}")
+            return False
+
+    def request_enable_bt(self, status_cb=None):
+        """Android 13+ 已禁止 app 静默打开蓝牙（adapter.enable() 会失效），改为弹系统确认框"""
+        try:
+            from jnius import autoclass
+            BluetoothAdapter = autoclass("android.bluetooth.BluetoothAdapter")
+            Intent = autoclass("android.content.Intent")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+            activity.startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+            print("[BT] 已发送 ACTION_REQUEST_ENABLE 请求")
+            self._report("请在系统弹窗中允许打开蓝牙", status_cb)
+            return True
+        except Exception as e:
+            print(f"[BT] request enable error: {e}")
+            self._report(f"无法打开蓝牙: {e}", status_cb)
+            return False
+
+    def location_report(self):
+        """定位开关状态：Android 11 及以下必须打开定位才能扫到设备（部分国产 ROM 也要求）"""
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            Context = autoclass("android.content.Context")
+            activity = PythonActivity.mActivity
+            lm = activity.getSystemService(Context.LOCATION_SERVICE)
+            return bool(lm.isLocationEnabled())
+        except Exception as e:
+            print(f"[BT] location check error: {e}")
+            return None
+
+    def _report(self, text, status_cb=None):
+        """把诊断信息打印到日志，并（可选）回显到界面"""
+        print(f"[BT] {text}")
+        cb = status_cb or getattr(self, "on_status", None)
+        if cb:
+            try:
+                Clock.schedule_once(lambda dt, t=text: cb(t), 0)
+            except Exception:
+                pass
 
     # -------- 扫描已配对设备 --------
     def get_paired_devices(self):
@@ -465,28 +753,36 @@ class BluetoothService:
                 bonded = self._bt_adapter.getBondedDevices().toArray()
                 self.paired_devices = []
                 for dev in bonded:
-                    self.paired_devices.append({
-                        "name": dev.getName() or "(未知设备)",
-                        "address": dev.getAddress(),
-                    })
+                    try:
+                        self.paired_devices.append({
+                            "name": dev.getName() or "(未知设备)",
+                            "address": dev.getAddress(),
+                        })
+                    except Exception as e_dev:
+                        print(f"[BT] 读取已配对设备失败: {e_dev}")
             except Exception as e:
+                # 最常见原因：BLUETOOTH_CONNECT 未授予
                 print(f"[BT] get_paired error: {e}")
+                self.last_error = f"读取已配对设备失败: {e}"
         return self.paired_devices
 
     # -------- 开启蓝牙 --------
     def enable_bt(self):
-        if platform == "android" and hasattr(self, "_bt_adapter"):
-            try:
-                if not self._bt_adapter.isEnabled():
-                    self._bt_adapter.enable()
-                    time.sleep(1.5)
-            except Exception as e:
-                print(f"[BT] enable error: {e}")
+        """确保蓝牙已打开。Android 13+ 已禁止 app 静默开启蓝牙（adapter.enable() 会失效），
+        这里只做检测；未打开时弹系统确认框（见 request_enable_bt）"""
+        if platform != "android" or not hasattr(self, "_bt_adapter"):
+            return False
+        if self.is_bt_enabled():
+            return True
+        self.request_enable_bt()
+        return False
 
     # -------- 扫描附近设备（带回调） --------
-    def start_scan(self, callback):
-        """开始扫描，每次发现调用 callback(device_dict)"""
+    def start_scan(self, callback, status_cb=None):
+        """开始扫描。callback(device_dict) 每发现一个设备调用一次；
+        status_cb(text) 把诊断信息（权限/蓝牙开关/扫描进度）回显到界面"""
         self.on_device_found = callback
+        self.on_status = status_cb
         self.scanned_devices = []
         if platform != "android":
             # 桌面模拟扫描：陆续上报几个假设备
@@ -501,60 +797,52 @@ class BluetoothService:
                     Clock.schedule_once(lambda dt, d=d: callback(d), 0)
             threading.Thread(target=_sim, daemon=True).start()
             return
-        # Android 原生扫描 — 用 Clock 在主线程调度，避免线程中调 jnius 崩溃
+        # Android：先在主线程确认权限（未授权则弹授权框，授权成功后再回调继续扫描）
+        self._report("检查蓝牙权限...", status_cb)
+        self.ensure_permissions(on_done=lambda: self._prepare_scan(callback), status_cb=status_cb)
+
+    def _prepare_scan(self, callback):
+        """权限就绪后：检查蓝牙开关 / 定位开关，再真正启动扫描"""
         try:
-            from android.permissions import check_permission, Permission
-            bt_scan_ok = check_permission(Permission.BLUETOOTH_SCAN)
-            bt_connect_ok = check_permission(Permission.BLUETOOTH_CONNECT)
-            loc_ok = check_permission(Permission.ACCESS_FINE_LOCATION)
-            if not (bt_scan_ok and bt_connect_ok and loc_ok):
-                print(f"[BT] Permissions not ready: scan={bt_scan_ok}, connect={bt_connect_ok}, loc={loc_ok}")
-                from android.permissions import request_permissions
-                request_permissions([Permission.BLUETOOTH_SCAN, Permission.BLUETOOTH_CONNECT, Permission.ACCESS_FINE_LOCATION])
-                # 用 Clock 调度延迟扫描，不用线程
-                Clock.schedule_once(lambda dt: self._do_start_scan(callback), 3.0)
+            if not self._bt_adapter:
+                self._report("无蓝牙适配器", self.on_status)
                 return
+            if not self.is_bt_enabled():
+                self._scan_retry = getattr(self, "_scan_retry", 0)
+                if self._scan_retry == 0:
+                    self.request_enable_bt(status_cb=self.on_status)
+                self._scan_retry += 1
+                if self._scan_retry <= 5:
+                    # 等用户在系统弹窗里点"允许"后再自动重试
+                    Clock.schedule_once(lambda dt: self._prepare_scan(callback), 2.0)
+                else:
+                    self._report("蓝牙未开启，请手动打开蓝牙后点「重新扫描」", self.on_status)
+                return
+            self._scan_retry = 0
+            if self.location_report() is False:
+                self._report("提醒：系统定位开关未打开，部分机型会因此扫不到设备", self.on_status)
             self._do_start_scan(callback)
         except Exception as e:
-            print(f"[BT] scan permission error: {e}")
-            # 权限检查失败也尝试扫描（主线程）
-            Clock.schedule_once(lambda dt: self._do_start_scan(callback), 0.5)
+            print(f"[BT] prepare scan error: {e}")
+            traceback.print_exc()
+            self._report(f"扫描准备失败: {e}", self.on_status)
 
     def _do_start_scan(self, callback):
-        """实际执行蓝牙扫描"""
+        """实际执行蓝牙扫描：经典发现 + BLE 扫描双引擎"""
         try:
-            self.enable_bt()
             from jnius import autoclass
-            Intent = autoclass("android.content.Intent")
             IntentFilter = autoclass("android.content.IntentFilter")
-            Context = autoclass("android.content.Context")
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             activity = PythonActivity.mActivity
 
-            # 检查蓝牙适配器状态
-            if not self._bt_adapter:
-                print("[BT] No bluetooth adapter!")
-                Clock.schedule_once(lambda dt, msg="无蓝牙适配器": callback({"name": msg, "address": "", "rssi": 0}), 0)
-                return
-            if not self._bt_adapter.isEnabled():
-                print("[BT] Bluetooth not enabled, trying to enable...")
-                self._bt_adapter.enable()
-                time.sleep(3)
-                if not self._bt_adapter.isEnabled():
-                    print("[BT] Bluetooth still not enabled")
-                    Clock.schedule_once(lambda dt, msg="蓝牙未开启，请手动开启蓝牙": callback({"name": msg, "address": "", "rssi": 0}), 0)
-                    return
-
-            print(f"[BT] Starting discovery... adapter={self._bt_adapter}")
-
-            # 使用模块级 ScanReceiver（不再在方法内定义，避免 jnius 崩溃）
+            self._report("正在扫描附近设备...", self.on_status)
+            # 使用模块级 ScanReceiver（不在方法内定义，避免 jnius 崩溃）
             self._scan_receiver = BtScanReceiver()
             self._scan_receiver.set_outer(self)
             flt = IntentFilter("android.bluetooth.device.action.FOUND")
             self._autoclass = autoclass
-            # Android 14 要求 registerReceiver 指定 flag
-            # 关键：ACTION_FOUND 是系统广播，必须用 RECEIVER_EXPORTED (flag=2)
-            # 用 RECEIVER_NOT_EXPORTED (flag=4) 会阻止系统广播 → 扫不到设备！
+            # Android 14 要求 registerReceiver 指定 flag：
+            # ACTION_FOUND 是系统广播，必须用 RECEIVER_EXPORTED (2)；用 4 会收不到广播
             try:
                 activity.registerReceiver(self._scan_receiver, flt, 2)
                 print("[BT] Receiver registered with RECEIVER_EXPORTED (flag=2)")
@@ -567,17 +855,19 @@ class BluetoothService:
                     print(f"[BT] registerReceiver completely failed: {e_reg2}")
 
             # 先注册广播，再开始扫描
-            result = self._bt_adapter.startDiscovery()
-            print(f"[BT] startDiscovery() returned: {result}")
+            try:
+                result = self._bt_adapter.startDiscovery()
+                print(f"[BT] startDiscovery() returned: {result}")
+                if not result:
+                    self._report("经典蓝牙扫描启动失败，改用 BLE 扫描", self.on_status)
+            except Exception as e_disc:
+                print(f"[BT] startDiscovery error: {e_disc}")
+                self._report(f"经典蓝牙扫描异常: {e_disc}", self.on_status)
 
-            # 同时启动 BLE 扫描（双引擎扫描，最大化发现设备概率）
-            print("[BT] Also starting BLE scan in parallel...")
+            # 同时启动 BLE 扫描（双引擎，最大化发现设备概率）
             self._start_ble_scan(callback)
 
-            if not result:
-                print("[BT] startDiscovery returned false, relying on BLE scanner only")
-
-            # 12秒后自动停止扫描（用 Clock 在主线程停止，避免线程中调 jnius）
+            # 12 秒后自动停止扫描（用 Clock 在主线程停止，避免线程中调 jnius）
             def _stop(dt):
                 try:
                     self._bt_adapter.cancelDiscovery()
@@ -591,21 +881,26 @@ class BluetoothService:
                     self._stop_ble_scan()
                 except Exception:
                     pass
+                n = len(self.scanned_devices)
+                if n:
+                    self._report(f"扫描完成，共发现 {n} 个新设备", self.on_status)
+                else:
+                    self._report("扫描完成，未发现新设备（确认对方处于可被发现状态后点「重新扫描」）",
+                                 self.on_status)
             Clock.schedule_once(_stop, 12)
         except Exception as e:
             print(f"[BT] scan error: {e}")
             traceback.print_exc()
+            self._report(f"扫描失败: {e}", self.on_status)
 
     def _start_ble_scan(self, callback):
-        """BLE 扫描作为 startDiscovery 的备选方案"""
+        """BLE 扫描作为经典扫描的补充（很多设备只在 BLE 广播里出现）"""
+        scanner = None
         try:
             from jnius import autoclass
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            activity = PythonActivity.mActivity
-
             scanner = self._bt_adapter.getBluetoothLeScanner()
             if scanner is None:
-                print("[BT] No BluetoothLeScanner available")
+                print("[BT-BLE] No BluetoothLeScanner available")
                 return
 
             # 创建 ScanSettings: SCAN_MODE_LOW_LATENCY 最快发现设备
@@ -624,7 +919,7 @@ class BluetoothService:
             print(f"[BT-BLE] Error: {e}")
             # 最后 fallback: 无参数版 startScan
             try:
-                if scanner and self._ble_callback:
+                if scanner is not None and getattr(self, "_ble_callback", None):
                     scanner.startScan(None, None, self._ble_callback)
                     print("[BT-BLE] BLE scan started (fallback, no settings)")
             except Exception as e2:
@@ -648,6 +943,7 @@ class BluetoothService:
         self.scanned_devices.append(info)
         if self.on_device_found:
             self.on_device_found(info)
+        self._report(f"已发现 {len(self.scanned_devices)} 个新设备")
 
     # -------- 连接设备（SPP） --------
     def connect(self, device, on_success=None, on_error=None):
@@ -1137,6 +1433,28 @@ class BTDialogContent(ScrollView):
         except Exception:
             pass
         self._box.add_widget(self._scan_title)
+        # 诊断状态行：权限 / 蓝牙开关 / 定位开关 / 扫描进度，出问题时一眼能看到原因
+        self._status_item = TwoLineListItem(
+            text="扫描状态",
+            secondary_text="准备中...",
+            divider=None,
+        )
+        self._apply_font(self._status_item)
+        try:
+            self._status_item.ids._lbl_primary.bold = True
+            self._status_item.ids._lbl_primary.font_size = "14sp"
+            self._status_item.ids._lbl_secondary.font_size = "12sp"
+        except Exception:
+            pass
+        self._box.add_widget(self._status_item)
+        # 重新扫描入口（授权或打开蓝牙后可随时重试）
+        self._rescan_item = OneLineListItem(
+            text="↻ 重新扫描",
+            on_release=lambda x: self.start_scan(),
+        )
+        self._apply_font(self._rescan_item)
+        self._box.add_widget(self._rescan_item, index=1)
+        self._found_count = 0
         # 填充已配对
         for d in BT.get_paired_devices():
             self._add_paired(d)
@@ -1164,11 +1482,29 @@ class BTDialogContent(ScrollView):
         self._box.add_widget(item, index=idx)
 
     def start_scan(self):
-        BT.start_scan(callback=self._on_found)
+        self._found_count = 0
+        try:
+            self._scan_title.text = "附近设备 (扫描中...)"
+        except Exception:
+            pass
+        BT.start_scan(callback=self._on_found, status_cb=self._on_status)
+
+    def _on_status(self, text):
+        """把蓝牙扫描的诊断信息显示到状态行"""
+        try:
+            self._status_item.secondary_text = text
+        except Exception:
+            pass
+        print(f"[BT-UI] {text}")
 
     @mainthread
     def _on_found(self, d):
         self._add_scanned(d)
+        self._found_count += 1
+        try:
+            self._scan_title.text = f"附近设备 (已发现 {self._found_count})"
+        except Exception:
+            pass
 
     def _emit_connect(self, dev):
         # dispatch event: 触发 bind 绑定的回调
@@ -1187,9 +1523,38 @@ class PlayerScreen(Screen):
 
     def __init__(self, **kw):
         super().__init__(**kw)
-        self._sound = None
+        self._player = None
         self._progress_ev = None
+        self._perm_retry = 0
         Clock.schedule_once(lambda dt: self.refresh_songs(), 0.5)
+
+    # ===== 播放引擎：Android=系统原生 MediaPlayer（支持 mp3），桌面=SoundLoader =====
+    def _get_player(self):
+        if self._player is None:
+            self._player = create_audio_player(
+                on_complete=self._on_song_end,
+                on_error=self._on_player_error,
+            )
+            print(f"[Player] 播放引擎: {self._player.backend}")
+        return self._player
+
+    def _stop_playback(self):
+        self.is_playing = False
+        if self._progress_ev:
+            self._progress_ev.cancel()
+            self._progress_ev = None
+        if self._player:
+            try:
+                self._player.release()
+            except Exception:
+                pass
+
+    def _on_player_error(self, msg):
+        self.is_playing = False
+        if self._progress_ev:
+            self._progress_ev.cancel()
+            self._progress_ev = None
+        App.get_running_app().toast(f"播放失败: {msg}", error=True)
 
     def on_enter(self):
         pass
@@ -1306,11 +1671,44 @@ class PlayerScreen(Screen):
             print(f"[Player] MediaStore scan error: {e}")
             App.get_running_app().toast(f"扫描失败: {e}", error=True)
 
+    def _ensure_audio_permission(self):
+        """Android 13+ 读媒体库需 READ_MEDIA_AUDIO（12 及以下用 READ_EXTERNAL_STORAGE）
+        返回 True=权限已就绪，False=刚发起了授权请求"""
+        try:
+            from android.permissions import check_permission, request_permissions, Permission
+        except Exception:
+            return True
+        perms = []
+        for name in ("READ_MEDIA_AUDIO", "READ_EXTERNAL_STORAGE"):
+            try:
+                perm = getattr(Permission, name)
+            except Exception:
+                continue
+            try:
+                if not check_permission(perm):
+                    perms.append(perm)
+            except Exception:
+                pass
+        if perms:
+            print(f"[Player] 请求媒体权限: {perms}")
+            try:
+                request_permissions(perms)
+            except Exception:
+                pass
+            return False
+        return True
+
     def refresh_songs(self):
         self.ids.song_list.clear_widgets()
         self.songs = []
         # Android: 直接用 MediaStore API 查询所有音频
         if platform == "android":
+            # 没有媒体权限时 MediaStore 查不到任何歌，先申请权限，再自动重试查一次
+            if not self._ensure_audio_permission() and self._perm_retry < 2:
+                self._perm_retry += 1
+                App.get_running_app().toast("请允许「音乐和音频」权限")
+                Clock.schedule_once(lambda dt: self.refresh_songs(), 3.5)
+                return
             self._scan_android_mediastore()
             return
         base = self.music_dir
@@ -1343,27 +1741,22 @@ class PlayerScreen(Screen):
         if idx < 0 or idx >= len(self.songs):
             return
         self.current_index = idx
-        name, path = self.songs[idx]
+        name, src = self.songs[idx]
         self.current_song = name
-        # 停止旧的
-        if self._sound:
-            try:
-                self._sound.stop()
-                self._sound.unload()
-            except Exception:
-                pass
-        # SAF content URI: 先复制到临时文件再播放
-        if path.startswith("content://"):
-            path = self._saf_to_temp(path)
-            if not path:
-                App.get_running_app().toast("无法读取音频文件", error=True)
-                return
-        self._sound = SoundLoader.load(path)
-        if not self._sound:
+        self._stop_playback()
+        player = self._get_player()
+        print(f"[Player] 播放: {name} <- {src}")
+        # Android 原生 MediaPlayer 可直接播 content:// URI（无需拷贝临时文件）
+        ok = player.load(src)
+        if not ok and src.startswith("content://"):
+            # 兜底：直接读 content:// 失败时，再拷贝成临时文件重试一次
+            tmp = self._saf_to_temp(src)
+            if tmp:
+                ok = player.load(tmp)
+        if not ok:
             App.get_running_app().toast("无法播放此格式", error=True)
             return
-        self._sound.bind(on_stop=self._on_song_end)
-        self._sound.play()
+        player.play()
         self.is_playing = True
         self.progress = 0
         if self._progress_ev:
@@ -1414,18 +1807,13 @@ class PlayerScreen(Screen):
                     pass
 
     def _update_progress(self, dt):
-        s = self._sound
-        if not s:
+        p = self._player
+        if not p:
             return
-        dur = s.length or 0
-        pos = s.get_pos() if hasattr(s, "get_pos") else 0
-        # SoundLoader 的 API 没有统一 get_pos，部分后端支持 length 属性
+        dur = p.length or 0
+        pos = p.pos or 0
         if dur > 0:
-            # fallback 估算
-            if not pos:
-                pos = min(self._sound._get_pos() if hasattr(self._sound, "_get_pos") else (self.progress / 100 * dur), dur)
-            pct = min(100, (pos / dur) * 100)
-            self.progress = pct
+            self.progress = min(100, (pos / dur) * 100)
             self.time_text = f"{self._fmt(pos)} / {self._fmt(dur)}"
 
     @staticmethod
@@ -1435,20 +1823,22 @@ class PlayerScreen(Screen):
         return f"{m:02d}:{s:02d}"
 
     def toggle_play(self):
-        if not self._sound and self.songs:
-            self.play_at(0)
-            return
-        if not self._sound:
+        if self._player is None or self.current_index < 0:
+            if self.songs:
+                self.play_at(0)
             return
         if self.is_playing:
-            self._sound.stop()
+            # 先置位再暂停：避免 Kivy 后端的 on_stop 回调被误判成"播放结束"而自动切歌
             self.is_playing = False
+            self._player.pause()
             if self._progress_ev:
                 self._progress_ev.cancel()
+                self._progress_ev = None
         else:
-            self._sound.play()
+            self._player.play()
             self.is_playing = True
-            self._progress_ev = Clock.schedule_interval(self._update_progress, 0.5)
+            if not self._progress_ev:
+                self._progress_ev = Clock.schedule_interval(self._update_progress, 0.5)
 
     def next_song(self):
         if not self.songs:
