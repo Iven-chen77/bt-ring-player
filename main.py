@@ -287,125 +287,11 @@ AUDIO_EXTS = (".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac")
 
 # ================= 蓝牙服务层 (跨平台封装) =================
 
-# 模块级定义 Java 回调类（定义在方法内部会导致 jnius 注册不稳定 → 闪退）
-try:
-    from jnius import PythonJavaClass, java_method
-
-    class BtScanReceiver(PythonJavaClass):
-        """蓝牙扫描广播接收器 — 模块级定义确保 jnius 稳定"""
-        __javainterfaces__ = ["android/content/BroadcastReceiver"]
-
-        def __init__(self):
-            super().__init__()
-            self.outer = None
-
-        def set_outer(self, outer):
-            self.outer = outer
-
-        @java_method("(Landroid/content/Context;Landroid/content/Intent;)V")
-        def onReceive(self, context, intent):
-            if self.outer is None:
-                return
-            try:
-                action = intent.getAction()
-                if action == "android.bluetooth.device.action.FOUND":
-                    dev = None
-                    try:
-                        dev = intent.getParcelableExtra("android.bluetooth.device.extra.DEVICE")
-                    except Exception:
-                        pass
-                    if dev is None:
-                        try:
-                            BluetoothDevice_cls = self.outer._autoclass("android.bluetooth.BluetoothDevice")
-                            method = intent.getClass().getMethod("getParcelableExtra",
-                                self.outer._autoclass("java.lang.String"),
-                                self.outer._autoclass("java.lang.Class"))
-                            dev = method.invoke(intent, "android.bluetooth.device.extra.DEVICE", BluetoothDevice_cls)
-                        except Exception as e2:
-                            print(f"[BT] getParcelableExtra 2-arg failed: {e2}")
-                    if dev is None:
-                        print("[BT] onReceive: device is null")
-                        return
-                    rssi = intent.getShortExtra("android.bluetooth.device.extra.RSSI", -999)
-                    try:
-                        name = dev.getName()
-                    except Exception:
-                        name = None
-                    try:
-                        addr = dev.getAddress()
-                    except Exception:
-                        addr = "(unknown)"
-                    if not name:
-                        name = "(未命名)"
-                    info = {"name": name, "address": addr, "rssi": int(rssi)}
-                    print(f"[BT] Found device: {info}")
-                    Clock.schedule_once(lambda dt, info=info: self.outer._on_found(info), 0)
-            except Exception as e:
-                print(f"[BT] ScanReceiver onReceive error: {e}")
-
-    class BtLeScanCallback(PythonJavaClass):
-        """BLE 扫描回调 — 模块级定义确保 jnius 稳定"""
-        __javainterfaces__ = ["android/bluetooth/le/ScanCallback"]
-        __javacontext__ = "app"
-
-        def __init__(self):
-            super().__init__()
-            self.outer = None
-
-        def set_outer(self, outer):
-            self.outer = outer
-
-        @java_method("(Landroid/bluetooth/le/ScanResult;)V")
-        def onScanResult(self, result):
-            if self.outer is None:
-                return
-            try:
-                dev = result.getDevice()
-                name = None
-                try:
-                    name = dev.getName()
-                except Exception:
-                    pass
-                try:
-                    addr = dev.getAddress()
-                except Exception:
-                    addr = "(unknown)"
-                if not name:
-                    name = "(未命名)"
-                rssi = result.getRssi()
-                info = {"name": name, "address": addr, "rssi": int(rssi)}
-                print(f"[BT-BLE] Found: {info}")
-                Clock.schedule_once(lambda dt, info=info: self.outer._on_found(info), 0)
-            except Exception as e:
-                print(f"[BT-BLE] onScanResult error: {e}")
-
-        @java_method("([Landroid/bluetooth/le/ScanResult;)V")
-        def onBatchScanResults(self, results):
-            pass
-
-        @java_method("(I)V")
-        def onScanFailed(self, errorCode):
-            codes = {
-                1: "ALREADY_STARTED(扫描已在运行)",
-                2: "APP_REGISTRATION_FAILED(应用注册失败)",
-                3: "INTERNAL_ERROR(系统内部错误)",
-                4: "FEATURE_UNSUPPORTED(不支持BLE扫描)",
-                5: "OUT_OF_HARDWARE_RESOURCES(硬件资源不足)",
-                6: "SCANNING_TOO_FREQUENTLY(扫描过于频繁，5秒内最多5次)",
-            }
-            print(f"[BT-BLE] Scan failed, error code: {errorCode}")
-            try:
-                # 该回调运行在 Java 线程，必须经 _report 切回主线程再更新 UI
-                if self.outer is not None:
-                    desc = codes.get(int(errorCode), "未知错误")
-                    self.outer._report(f"BLE 扫描失败: {desc}")
-            except Exception as e:
-                print(f"[BT-BLE] onScanFailed report error: {e}")
-
-except ImportError:
-    # jnius 不可用时（桌面端）创建空占位类
-    BtScanReceiver = None
-    BtLeScanCallback = None
+# 蓝牙扫描回调不在这里用 PythonJavaClass 实现。
+# 原因：jnius 的 PythonJavaClass 底层是 java.lang.reflect.Proxy，只能代理「接口」，
+# 而 BroadcastReceiver / ScanCallback 都是「抽象类」，实例化时会抛
+#   java.lang.IllegalArgumentException: android.content.BroadcastReceiver is not an interface
+# 因此扫描回调改在 Java 侧实现，见 src/org/btring/BtBridge.java。
 
 
 # ================= 音频播放后端 =================
@@ -674,6 +560,11 @@ class BluetoothService:
             self._permissions_granted = False
             self.last_error = ""
             self.on_status = None
+            # Java 侧扫描桥接类（BroadcastReceiver / ScanCallback 都是抽象类，
+            # jnius 的 PythonJavaClass 无法代理，只能在 Java 里实现，见 src/org/btring/BtBridge.java）
+            self._BtBridge = autoclass("org.btring.BtBridge")
+            self._ClassicReceiver = autoclass("org.btring.BtBridge$ClassicReceiver")
+            self._BleCallback = autoclass("org.btring.BtBridge$BleCallback")
             # Android 12(API 31) 起扫描用 BLUETOOTH_SCAN / BLUETOOTH_CONNECT 运行时权限；
             # 更低版本靠 ACCESS_FINE_LOCATION，且必须打开系统定位开关才扫得到设备
             try:
@@ -683,6 +574,9 @@ class BluetoothService:
             print(f"[BT] Android init done, sdk={self._sdk_int}")
         except Exception as e:
             print(f"[BT] Android init error: {e}")
+            self._BtBridge = None
+            self._ClassicReceiver = None
+            self._BleCallback = None
 
     # -------- 权限 & 开关状态（带诊断信息） --------
     def _required_perms(self):
@@ -943,7 +837,14 @@ class BluetoothService:
             self._report(f"扫描准备失败: {jni_detail(e)}", self.on_status)
 
     def _cleanup_scan(self):
-        """停止上一次扫描并注销旧的广播接收器，避免重复扫描时 receiver 越挂越多"""
+        """停止上一次扫描：取消轮询、注销旧广播接收器、停 BLE 扫描"""
+        ev = getattr(self, "_poll_ev", None)
+        if ev is not None:
+            try:
+                ev.cancel()
+            except Exception:
+                pass
+            self._poll_ev = None
         try:
             if getattr(self, "_bt_adapter", None):
                 self._bt_adapter.cancelDiscovery()
@@ -965,10 +866,15 @@ class BluetoothService:
 
     def _do_start_scan(self, callback):
         """实际执行蓝牙扫描：经典发现 + BLE 扫描双引擎。
-        每一步单独 try/except 并报告到界面，失败时能立刻看出是哪一步、
-        是哪类 Java 异常（SecurityException / 参数错误 等）。"""
+        回调由 Java 侧 BtBridge 实现（PythonJavaClass 无法代理抽象类），
+        结果存在 Java 静态列表里，Python 侧定时轮询取走。"""
         from jnius import autoclass
         self._cleanup_scan()
+
+        if getattr(self, "_BtBridge", None) is None:
+            self._report("扫描失败：Java 桥接类 org.btring.BtBridge 未加载（android.add_src 未生效）",
+                         self.on_status)
+            return
 
         # --- 步骤1: 构造 IntentFilter ---
         try:
@@ -978,18 +884,15 @@ class BluetoothService:
         except Exception as e:
             self._report(f"扫描失败(创建过滤器): {jni_detail(e)}", self.on_status)
             return
-        self._autoclass = autoclass
         self._scan_activity = activity
 
-        # --- 步骤2: 注册 ACTION_FOUND 广播接收器 ---
+        # --- 步骤2: 创建 + 注册 Java 侧广播接收器 ---
         try:
-            self._scan_receiver = BtScanReceiver()
-            self._scan_receiver.set_outer(self)
+            self._scan_receiver = self._ClassicReceiver()
         except Exception as e:
             self._report(f"扫描失败(创建接收器): {jni_detail(e)}", self.on_status)
             return
-        # 先试不带 flag 的两参版本（Android 13+ 注册纯系统广播合法），
-        # 失败再试带 flag 的三参版本（避免 Python int 在 jnius 中重载解析失败）
+        # 先试不带 flag 的两参版本（注册纯系统广播合法），失败再试带 flag 的三参版本
         try:
             activity.registerReceiver(self._scan_receiver, flt)
             self._receiver_registered = True
@@ -1004,29 +907,36 @@ class BluetoothService:
                 self._report(f"扫描失败(注册接收器): 两参={jni_detail(e1)} / 三参={jni_detail(e2)}",
                              self.on_status)
 
-        # --- 步骤3: 经典蓝牙发现 ---
+        # --- 步骤3: 清空旧结果 + 开始轮询 ---
+        try:
+            self._BtBridge.reset()
+        except Exception as e:
+            print(f"[BT] bridge reset error: {jni_detail(e)}")
+        self._report("正在扫描附近设备...", self.on_status)
+        self._poll_ev = Clock.schedule_interval(self._poll_scan_results, 0.6)
+
+        # --- 步骤4: 经典蓝牙发现 ---
         try:
             result = self._bt_adapter.startDiscovery()
             print(f"[BT] startDiscovery() returned: {result}")
             if not result:
                 self._report("经典蓝牙扫描启动失败，继续尝试 BLE 扫描", self.on_status)
-            else:
-                self._report("正在扫描附近设备...", self.on_status)
         except Exception as e:
             print(f"[BT] startDiscovery error: {e}")
             self._report(f"经典蓝牙扫描异常: {jni_detail(e)}", self.on_status)
 
-        # --- 步骤4: BLE 扫描（双引擎） ---
+        # --- 步骤5: BLE 扫描（双引擎） ---
         self._start_ble_scan(callback)
 
-        # --- 步骤5: 12 秒后自动停止 ---
-        # 用「扫描代数」标记本轮扫描：用户中途点「重新扫描」后，旧的定时器不应再去动新一轮的 receiver
+        # --- 步骤6: 12 秒后自动停止 ---
+        # 用「扫描代数」标记本轮扫描：用户中途点「重新扫描」后，旧的定时器不应再动新一轮的 receiver
         self._scan_gen = getattr(self, "_scan_gen", 0) + 1
         gen = self._scan_gen
 
         def _stop(dt):
             if gen != getattr(self, "_scan_gen", 0):
                 return
+            self._poll_scan_results()      # 把最后一批结果收进来
             self._cleanup_scan()
             n = len(self.scanned_devices)
             if n:
@@ -1035,6 +945,44 @@ class BluetoothService:
                 self._report("扫描完成，未发现新设备（确认对方处于可被发现状态后点「重新扫描」）",
                              self.on_status)
         Clock.schedule_once(_stop, 12)
+
+    def _poll_scan_results(self, dt=None):
+        """轮询 Java 侧收集到的扫描结果（0.6 秒一次）。
+        结果格式：name|address|rssi"""
+        bridge = getattr(self, "_BtBridge", None)
+        if bridge is None:
+            return
+        try:
+            for raw in bridge.drain():
+                s = str(raw)
+                parts = s.split("|")
+                if len(parts) < 2:
+                    continue
+                name = parts[0].strip() or "(未命名)"
+                addr = parts[1].strip()
+                rssi = parts[2].strip() if len(parts) > 2 else ""
+                if not addr or addr == "(unknown)":
+                    continue
+                self._on_found({"name": name, "address": addr, "rssi": rssi})
+        except Exception as e:
+            print(f"[BT] poll drain error: {jni_detail(e)}")
+        try:
+            code = bridge.drainError()
+            if code:
+                self._report(f"BLE 扫描失败: {self._ble_err_desc(code)}", self.on_status)
+        except Exception as e:
+            print(f"[BT] poll error code failed: {jni_detail(e)}")
+
+    @staticmethod
+    def _ble_err_desc(code):
+        return {
+            1: "ALREADY_STARTED(扫描已在运行)",
+            2: "APP_REGISTRATION_FAILED(应用注册失败)",
+            3: "INTERNAL_ERROR(系统内部错误)",
+            4: "FEATURE_UNSUPPORTED(不支持BLE扫描)",
+            5: "OUT_OF_HARDWARE_RESOURCES(硬件资源不足)",
+            6: "SCANNING_TOO_FREQUENTLY(扫描过于频繁)",
+        }.get(int(code), f"未知错误({code})")
 
     def _start_ble_scan(self, callback):
         """BLE 扫描作为经典扫描的补充（很多设备只在 BLE 广播里出现）"""
@@ -1052,38 +1000,42 @@ class BluetoothService:
             settings_builder.setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             settings = settings_builder.build()
 
-            # 使用模块级 LeScanCallback
-            self._ble_callback = BtLeScanCallback()
-            self._ble_callback.set_outer(self)
+            # 使用 Java 侧 BleCallback（ScanCallback 是抽象类，Python 侧无法实现）
+            self._ble_callback = self._BleCallback()
             scanner.startScan(None, settings, self._ble_callback)
             self._ble_scanner = scanner
             print("[BT-BLE] BLE scan started with LOW_LATENCY settings")
         except Exception as e:
-            print(f"[BT-BLE] Error: {e}")
+            print(f"[BT-BLE] Error: {jni_detail(e)}")
             last = e
-            # 最后 fallback: 无参数版 startScan
+            # 最后 fallback: 无参 ScanSettings 版本
             try:
                 if scanner is not None:
                     if getattr(self, "_ble_callback", None) is None:
-                        self._ble_callback = BtLeScanCallback()
-                        self._ble_callback.set_outer(self)
+                        self._ble_callback = self._BleCallback()
                     scanner.startScan(None, None, self._ble_callback)
                     self._ble_scanner = scanner
                     print("[BT-BLE] BLE scan started (fallback, no settings)")
                     return
             except Exception as e2:
-                print(f"[BT-BLE] Fallback also failed: {e2}")
+                print(f"[BT-BLE] Fallback also failed: {jni_detail(e2)}")
                 last = e2
             self._report(f"BLE 扫描启动失败: {jni_detail(last)}", self.on_status)
 
     def _stop_ble_scan(self):
         """停止 BLE 扫描"""
+        cb = getattr(self, "_ble_callback", None)
+        scanner = getattr(self, "_ble_scanner", None)
+        if cb is None or scanner is None:
+            return
         try:
-            if hasattr(self, "_ble_scanner") and self._ble_scanner and hasattr(self, "_ble_callback"):
-                self._ble_scanner.stopScan(self._ble_callback)
-                print("[BT-BLE] BLE scan stopped")
+            scanner.stopScan(cb)
+            print("[BT-BLE] BLE scan stopped")
         except Exception as e:
-            print(f"[BT-BLE] stop error: {e}")
+            print(f"[BT-BLE] stop error: {jni_detail(e)}")
+        finally:
+            self._ble_callback = None
+            self._ble_scanner = None
 
     @mainthread
     def _on_found(self, info):
@@ -1542,7 +1494,7 @@ class MainScreen(Screen):
                 buttons=[close_btn],
             )
             self.bt_dialog = dialog
-            content.bind(on_connect_requested=self._on_connect_from_dialog)
+            content.on_connect_requested = self._on_connect_from_dialog
             content.start_scan()
             dialog.open()
             # MDDialog.open() 后动态创建内部子控件，必须扫一遍
@@ -1596,7 +1548,10 @@ class MainScreen(Screen):
 
 class BTDialogContent(ScrollView):
     """蓝牙弹窗的二级界面：已配对列表 + 扫描到的设备列表"""
-    on_connect_requested = ObjectProperty(None)  # Kivy Property: 支持 bind/dispatch
+    # 注意：不要用 ObjectProperty + dispatch()。
+    # Kivy 的 dispatch() 要求事件已注册（未注册会抛 KeyError: 'on_connect_requested'），
+    # 只声明同名 Property 并不等于注册事件。这里用普通属性回调，最稳。
+    on_connect_requested = None
 
     @staticmethod
     def _apply_font(item):
@@ -1743,9 +1698,13 @@ class BTDialogContent(ScrollView):
             print(f"[BT-UI] add scanned error: {e}")
 
     def _emit_connect(self, dev):
-        # dispatch event: 触发 bind 绑定的回调
+        """点击设备项：调用外部注册的回调（普通属性，不走 Kivy dispatch）"""
         try:
-            self.dispatch("on_connect_requested", self, dev)
+            cb = self.on_connect_requested
+            if cb is None:
+                print("[BT-UI] on_connect_requested 未注册")
+                return
+            cb(self, dev)
         except Exception as e:
             print("[BT-UI] emit connect EXCEPTION:")
             traceback.print_exc()

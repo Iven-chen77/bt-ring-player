@@ -63,6 +63,11 @@ android.allow_backup = True
 #   READ_MEDIA_AUDIO = Android 13+ 读取音频
 android.permissions = BLUETOOTH,BLUETOOTH_ADMIN,BLUETOOTH_SCAN,BLUETOOTH_CONNECT,BLUETOOTH_ADVERTISE,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE,READ_MEDIA_AUDIO,INTERNET,VIBRATE,WAKE_LOCK,FOREGROUND_SERVICE,FOREGROUND_SERVICE_CONNECTED_DEVICE
 
+# (list) 需要一起编译的 Java 源码目录
+# 蓝牙扫描回调必须用 Java 实现：jnius 的 PythonJavaClass 只能代理接口，
+# 而 BroadcastReceiver / ScanCallback 都是抽象类，Python 侧无法实现。
+android.add_src = %(source.dir)s/src
+
 # (str) 应用图标路径 (放一张 512x512 的 png 到项目根目录并改这里)
 # icon.filename = %(source.dir)s/data/icon.png
 
