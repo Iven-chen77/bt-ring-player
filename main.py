@@ -535,6 +535,8 @@ class BluetoothService:
         self.on_disconnected = None   # 回调: 断开
         self._android_bt = None
         self._socket = None
+        self._gatt_mode = False       # True 表示当前是 BLE GATT 连接（非 RFCOMM）
+        self._BtBridge = None
         self._init_platform()
 
     def _init_platform(self):
@@ -564,7 +566,6 @@ class BluetoothService:
             # jnius 的 PythonJavaClass 无法代理，只能在 Java 里实现，见 src/org/btring/BtBridge.java）
             self._BtBridge = autoclass("org.btring.BtBridge")
             self._ClassicReceiver = autoclass("org.btring.BtBridge$ClassicReceiver")
-            self._BleCallback = autoclass("org.btring.BtBridge$BleCallback")
             # Android 12(API 31) 起扫描用 BLUETOOTH_SCAN / BLUETOOTH_CONNECT 运行时权限；
             # 更低版本靠 ACCESS_FINE_LOCATION，且必须打开系统定位开关才扫得到设备
             try:
@@ -576,7 +577,6 @@ class BluetoothService:
             print(f"[BT] Android init error: {e}")
             self._BtBridge = None
             self._ClassicReceiver = None
-            self._BleCallback = None
 
     # -------- 权限 & 开关状态（带诊断信息） --------
     def _required_perms(self):
@@ -916,22 +916,17 @@ class BluetoothService:
         self._poll_ev = Clock.schedule_interval(self._poll_scan_results, 0.6)
 
         # --- 步骤4: 经典蓝牙发现 ---
-        try:
-            result = self._bt_adapter.startDiscovery()
-            print(f"[BT] startDiscovery() returned: {result}")
-            if not result:
-                self._report("经典蓝牙扫描启动失败，继续尝试 BLE 扫描", self.on_status)
-        except Exception as e:
-            print(f"[BT] startDiscovery error: {e}")
-            self._report(f"经典蓝牙扫描异常: {jni_detail(e)}", self.on_status)
+        # cancelDiscovery() 是异步的：刚取消就立刻 startDiscovery() 往往返回 False
+        # （系统认为发现流程仍在进行中），所以这里带重试。
+        self._scan_gen = getattr(self, "_scan_gen", 0) + 1
+        gen = self._scan_gen
+        self._try_start_discovery(gen, 0)
 
         # --- 步骤5: BLE 扫描（双引擎） ---
         self._start_ble_scan(callback)
 
         # --- 步骤6: 12 秒后自动停止 ---
         # 用「扫描代数」标记本轮扫描：用户中途点「重新扫描」后，旧的定时器不应再动新一轮的 receiver
-        self._scan_gen = getattr(self, "_scan_gen", 0) + 1
-        gen = self._scan_gen
 
         def _stop(dt):
             if gen != getattr(self, "_scan_gen", 0):
@@ -945,6 +940,22 @@ class BluetoothService:
                 self._report("扫描完成，未发现新设备（确认对方处于可被发现状态后点「重新扫描」）",
                              self.on_status)
         Clock.schedule_once(_stop, 12)
+
+    def _try_start_discovery(self, gen, attempt):
+        """启动经典蓝牙发现，带重试（cancelDiscovery 异步完成前 startDiscovery 会返回 False）"""
+        if gen != getattr(self, "_scan_gen", 0):
+            return
+        try:
+            result = self._bt_adapter.startDiscovery()
+            print(f"[BT] startDiscovery() attempt={attempt} returned: {result}")
+            if result:
+                return
+        except Exception as e:
+            print(f"[BT] startDiscovery error: {jni_detail(e)}")
+        if attempt < 3:
+            Clock.schedule_once(lambda dt: self._try_start_discovery(gen, attempt + 1), 0.6)
+        else:
+            self._report("经典蓝牙扫描启动失败（指望 BLE 扫描）", self.on_status)
 
     def _poll_scan_results(self, dt=None):
         """轮询 Java 侧收集到的扫描结果（0.6 秒一次）。
@@ -985,56 +996,34 @@ class BluetoothService:
         }.get(int(code), f"未知错误({code})")
 
     def _start_ble_scan(self, callback):
-        """BLE 扫描作为经典扫描的补充（很多设备只在 BLE 广播里出现）"""
-        scanner = None
+        """BLE 扫描作为经典扫描的补充（很多设备只在 BLE 广播里出现）。
+        ScanSettings 必须在 Java 侧构造：Python 侧经 jnius 传回 Java 会变成 null，
+        startScan 会抛 IllegalArgumentException: settings is null（真机日志已验证）。"""
         try:
-            from jnius import autoclass
             scanner = self._bt_adapter.getBluetoothLeScanner()
             if scanner is None:
                 self._report("BLE 扫描不可用（未获取到扫描器）", self.on_status)
                 return
-
-            # 创建 ScanSettings: SCAN_MODE_LOW_LATENCY 最快发现设备
-            ScanSettings = autoclass("android.bluetooth.le.ScanSettings")
-            settings_builder = ScanSettings.Builder()
-            settings_builder.setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            settings = settings_builder.build()
-
-            # 使用 Java 侧 BleCallback（ScanCallback 是抽象类，Python 侧无法实现）
-            self._ble_callback = self._BleCallback()
-            scanner.startScan(None, settings, self._ble_callback)
+            err = self._BtBridge.startBleScan(scanner)
+            if err:
+                self._report(f"BLE 扫描启动失败: {err}", self.on_status)
+                return
             self._ble_scanner = scanner
-            print("[BT-BLE] BLE scan started with LOW_LATENCY settings")
+            print("[BT-BLE] BLE scan started (via Java bridge)")
         except Exception as e:
-            print(f"[BT-BLE] Error: {jni_detail(e)}")
-            last = e
-            # 最后 fallback: 无参 ScanSettings 版本
-            try:
-                if scanner is not None:
-                    if getattr(self, "_ble_callback", None) is None:
-                        self._ble_callback = self._BleCallback()
-                    scanner.startScan(None, None, self._ble_callback)
-                    self._ble_scanner = scanner
-                    print("[BT-BLE] BLE scan started (fallback, no settings)")
-                    return
-            except Exception as e2:
-                print(f"[BT-BLE] Fallback also failed: {jni_detail(e2)}")
-                last = e2
-            self._report(f"BLE 扫描启动失败: {jni_detail(last)}", self.on_status)
+            self._report(f"BLE 扫描启动异常: {jni_detail(e)}", self.on_status)
 
     def _stop_ble_scan(self):
         """停止 BLE 扫描"""
-        cb = getattr(self, "_ble_callback", None)
         scanner = getattr(self, "_ble_scanner", None)
-        if cb is None or scanner is None:
+        if scanner is None:
             return
         try:
-            scanner.stopScan(cb)
+            self._BtBridge.stopBleScan(scanner)
             print("[BT-BLE] BLE scan stopped")
         except Exception as e:
             print(f"[BT-BLE] stop error: {jni_detail(e)}")
         finally:
-            self._ble_callback = None
             self._ble_scanner = None
 
     @mainthread
@@ -1153,19 +1142,38 @@ class BluetoothService:
             self._safe_error(f"[配对等待] {jni_detail(e)}")
 
     def _connect_step3(self, dev):
-        """Step 3: 创建 socket + 连接。
-        注意：BluetoothSocket.connect() 是阻塞调用，必须放到后台线程执行，
-        否则主线程被阻塞会触发 ANR 直接闪退。"""
+        """Step 3: 连接设备。
+        智能戒指等设备绝大多数是 BLE-only（只提供 GATT 服务，没有经典蓝牙 SPP），
+        用 createRfcommSocketToServiceRecord 去连必然失败
+        （真机日志：BluetoothSocketException / read failed, socket might closed）。
+        所以这里按设备类型分流：
+          - LE(2)      -> 直接走 GATT
+          - CLASSIC(1) -> 走 RFCOMM，失败后再回退 GATT
+          - DUAL(3)/未知 -> 先 RFCOMM，失败回退 GATT
+        """
+        try:
+            dtype = self._BtBridge.deviceType(dev)
+        except Exception as e:
+            print(f"[BT] getType error: {jni_detail(e)}")
+            dtype = 0
+        type_desc = {1: "经典", 2: "BLE", 3: "双模"}.get(dtype, "未知")
+        self._report(f"设备类型: {type_desc}")
+        if dtype == 2:
+            self._connect_gatt(dev)
+            return
+
         try:
             self._bt_adapter.cancelDiscovery()
             print("[BT] creating RFCOMM socket...")
             try:
                 sock = dev.createRfcommSocketToServiceRecord(self._spp_uuid)
             except Exception as e:
-                self._safe_error(f"[step3-建Socket] {jni_detail(e)}")
+                self._report(f"RFCOMM 建 Socket 失败({jni_detail(e)})，改走 GATT")
+                self._connect_gatt(dev)
                 return
             if sock is None:
-                self._safe_error("无法创建 Socket")
+                self._report("无法创建 Socket，改走 GATT")
+                self._connect_gatt(dev)
                 return
             self._socket = sock
 
@@ -1174,6 +1182,7 @@ class BluetoothService:
                     print("[BT] connecting socket (background thread)...")
                     sock.connect()
                     self.connected = True
+                    self._gatt_mode = False
                     print(f"[BT] connected to {self.connected_device.get('name', '?')}")
 
                     def _on_ok(dt):
@@ -1190,13 +1199,79 @@ class BluetoothService:
                         pass
                     self._socket = None
                     detail = jni_detail(e)
-                    Clock.schedule_once(lambda dt, d=detail: self._safe_error(f"[step3-连接] {d}"), 0)
+                    # RFCOMM 失败不代表设备连不上，很可能它是 BLE-only 设备 -> 回退 GATT
+                    def _fallback(dt):
+                        self._report(f"RFCOMM 连接失败({detail})，改走 GATT 连接")
+                        self._connect_gatt(dev)
+                    Clock.schedule_once(_fallback, 0)
 
             threading.Thread(target=_do_connect, daemon=True).start()
         except Exception as e:
             print(f"[BT] connect step3 error: {e}")
             self.connected = False
-            self._safe_error(f"[step3] {jni_detail(e)}")
+            self._connect_gatt(dev)
+
+    def _connect_gatt(self, dev):
+        """用 BLE GATT 连接（智能戒指/手环等 BLE 设备的唯一可行方式）"""
+        try:
+            from jnius import autoclass
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+        except Exception as e:
+            self._safe_error(f"[GATT-初始化] {jni_detail(e)}")
+            return
+        try:
+            err = self._BtBridge.gattConnect(activity, dev)
+        except Exception as e:
+            self._safe_error(f"[GATT-建立] {jni_detail(e)}")
+            return
+        if err:
+            self._safe_error(f"[GATT-建立] {err}")
+            return
+        self._report("正在建立 GATT 连接...")
+        self._gatt_poll_count = 0
+        self._gatt_last_msg = ""
+        Clock.schedule_once(self._poll_gatt, 0.5)
+
+    def _poll_gatt(self, dt=None):
+        """轮询 GATT 连接状态（回调在 Java 线程，只能靠轮询把结果取回来）"""
+        bridge = getattr(self, "_BtBridge", None)
+        if bridge is None:
+            self._safe_error("[GATT-状态] 桥接类未加载")
+            return
+        try:
+            state = bridge.gattState()
+            msg = bridge.gattMessage()
+        except Exception as e:
+            self._safe_error(f"[GATT-状态] {jni_detail(e)}")
+            return
+        if msg and msg != getattr(self, "_gatt_last_msg", ""):
+            self._gatt_last_msg = msg
+            self._report(msg)
+
+        if state == self._BtBridge.GATT_DISCOVERED:
+            self.connected = True
+            self._gatt_mode = True
+            try:
+                chars = [str(c) for c in bridge.gattChars()]
+                for c in chars[:12]:
+                    print(f"[BT-GATT] 特征: {c}")
+                self._report(f"GATT 已就绪，共 {len(chars)} 个特征（详情见诊断日志）")
+            except Exception:
+                pass
+            if self.on_connected:
+                self.on_connected(self.connected_device)
+            return
+
+        if state == self._BtBridge.GATT_FAILED:
+            self.connected = False
+            self._safe_error(f"[GATT-连接] {msg or '连接失败'}")
+            return
+
+        self._gatt_poll_count = getattr(self, "_gatt_poll_count", 0) + 1
+        if self._gatt_poll_count > 30:
+            self._safe_error("[GATT-超时] 连接超时（设备可能不在范围内，或已被其他手机连接）")
+            return
+        Clock.schedule_once(self._poll_gatt, 0.5)
 
     def _safe_error(self, msg):
         """安全地调用错误回调（同时写入 bt_debug.log，方便事后排查）"""
@@ -1222,6 +1297,12 @@ class BluetoothService:
     def disconnect(self):
         self.connected = False
         try:
+            if getattr(self, "_gatt_mode", False):
+                self._BtBridge.gattDisconnect()
+        except Exception as e:
+            print(f"[BT] gatt disconnect error: {jni_detail(e)}")
+        self._gatt_mode = False
+        try:
             if self._socket:
                 self._socket.close()
         except Exception:
@@ -1237,13 +1318,24 @@ class BluetoothService:
             # 桌面模拟：打印指令
             print(f"[BT][SIM] 发送响铃指令: {RING_CMD.hex()}")
             return True, "已发送(模拟)"
+        # GATT 模式（BLE 设备）：写到第一个可写特征
+        if getattr(self, "_gatt_mode", False):
+            try:
+                from jnius import jarray
+                payload = jarray("b")([b if b < 128 else b - 256 for b in RING_CMD])
+                err = self._BtBridge.gattWrite(payload)
+                if err:
+                    return False, f"发送失败(GATT): {err}"
+                return True, "响铃指令已发送(GATT)"
+            except Exception as e:
+                return False, f"发送失败(GATT): {jni_detail(e)}"
         try:
             ostream = self._socket.getOutputStream()
             ostream.write(RING_CMD)
             ostream.flush()
             return True, "响铃指令已发送"
         except Exception as e:
-            return False, f"发送失败: {e}"
+            return False, f"发送失败: {jni_detail(e)}"
 
     # -------- 自动重连：尝试连接上次保存的设备 --------
     def try_autoconnect(self, on_success, on_fail):
