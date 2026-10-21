@@ -586,7 +586,8 @@ class BluetoothService:
         except Exception:
             return []
         perms = []
-        names = ("BLUETOOTH_SCAN", "BLUETOOTH_CONNECT") if getattr(self, "_sdk_int", 0) >= 31 \
+        names = ("BLUETOOTH_SCAN", "BLUETOOTH_CONNECT", "ACCESS_FINE_LOCATION") \
+            if getattr(self, "_sdk_int", 0) >= 31 \
             else ("ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION")
         for name in names:
             try:
@@ -596,10 +597,13 @@ class BluetoothService:
         return perms
 
     def _java_perm_names(self):
-        """返回需要检查的 Android 权限全名列表（用系统 API 校验，最可靠）"""
+        """返回需要检查的 Android 权限全名列表（用系统 API 校验，最可靠）。
+        Android 12+ 也要 ACCESS_FINE_LOCATION：因为我们没有声明 neverForLocation
+        （国产 ROM 对该标记的兼容性有问题，会导致扫描 0 结果）。"""
         if getattr(self, "_sdk_int", 0) >= 31:
             return ["android.permission.BLUETOOTH_SCAN",
-                    "android.permission.BLUETOOTH_CONNECT"]
+                    "android.permission.BLUETOOTH_CONNECT",
+                    "android.permission.ACCESS_FINE_LOCATION"]
         return ["android.permission.ACCESS_FINE_LOCATION"]
 
     def _has_java_permission(self, perm):
@@ -920,12 +924,13 @@ class BluetoothService:
         # （系统认为发现流程仍在进行中），所以这里带重试。
         self._scan_gen = getattr(self, "_scan_gen", 0) + 1
         gen = self._scan_gen
+        self._log_adapter_state()
         self._try_start_discovery(gen, 0)
 
         # --- 步骤5: BLE 扫描（双引擎） ---
         self._start_ble_scan(callback)
 
-        # --- 步骤6: 12 秒后自动停止 ---
+        # --- 步骤6: 20 秒后自动停止 ---
         # 用「扫描代数」标记本轮扫描：用户中途点「重新扫描」后，旧的定时器不应再动新一轮的 receiver
 
         def _stop(dt):
@@ -939,7 +944,18 @@ class BluetoothService:
             else:
                 self._report("扫描完成，未发现新设备（确认对方处于可被发现状态后点「重新扫描」）",
                              self.on_status)
-        Clock.schedule_once(_stop, 12)
+        Clock.schedule_once(_stop, 20)
+
+    def _log_adapter_state(self):
+        """把蓝牙适配器状态写进诊断日志，用于判断扫描是否被系统层面拦截"""
+        try:
+            a = self._bt_adapter
+            st = a.getState()             # 12=STATE_ON
+            discovering = a.isDiscovering()
+            enabled = a.isEnabled()
+            self._report(f"适配器状态: state={st} enabled={enabled} isDiscovering={discovering}")
+        except Exception as e:
+            self._report(f"读取适配器状态失败: {jni_detail(e)}")
 
     def _try_start_discovery(self, gen, attempt):
         """启动经典蓝牙发现，带重试（cancelDiscovery 异步完成前 startDiscovery 会返回 False）"""
@@ -1009,6 +1025,7 @@ class BluetoothService:
                 self._report(f"BLE 扫描启动失败: {err}", self.on_status)
                 return
             self._ble_scanner = scanner
+            self._report("BLE 扫描已启动（等待广播中...）", self.on_status)
             print("[BT-BLE] BLE scan started (via Java bridge)")
         except Exception as e:
             self._report(f"BLE 扫描启动异常: {jni_detail(e)}", self.on_status)
@@ -1094,6 +1111,7 @@ class BluetoothService:
                 return
             self._connect_dev = dev
             # 下一步：检查配对状态
+            self._report(f"开始连接: {device.get('name', '?')} ({addr})")
             Clock.schedule_once(lambda dt: self._connect_step2(dev), 0.1)
         except Exception as e:
             print(f"[BT] connect step1 error: {e}")
@@ -1244,7 +1262,11 @@ class BluetoothService:
         except Exception as e:
             self._safe_error(f"[GATT-状态] {jni_detail(e)}")
             return
-        if msg and msg != getattr(self, "_gatt_last_msg", ""):
+        self._gatt_poll_count = getattr(self, "_gatt_poll_count", 0) + 1
+        # 每 4 次（约 2 秒）记录一次状态，用于判断是卡在 CONNECTING 还是压根没回调
+        if self._gatt_poll_count % 4 == 1:
+            self._report(f"GATT 状态: state={state}({self._gatt_state_desc(state)}) {msg}")
+        elif msg and msg != getattr(self, "_gatt_last_msg", ""):
             self._gatt_last_msg = msg
             self._report(msg)
 
@@ -1269,9 +1291,15 @@ class BluetoothService:
 
         self._gatt_poll_count = getattr(self, "_gatt_poll_count", 0) + 1
         if self._gatt_poll_count > 30:
-            self._safe_error("[GATT-超时] 连接超时（设备可能不在范围内，或已被其他手机连接）")
+            self._safe_error("[GATT-超时] 连接超时（设备可能不在范围内、已关机、"
+                             "或已被其他手机/系统蓝牙连接占用）")
             return
         Clock.schedule_once(self._poll_gatt, 0.5)
+
+    @staticmethod
+    def _gatt_state_desc(state):
+        return {0: "IDLE", 1: "CONNECTING", 2: "CONNECTED",
+                3: "DISCOVERED", 4: "FAILED"}.get(int(state), "?")
 
     def _safe_error(self, msg):
         """安全地调用错误回调（同时写入 bt_debug.log，方便事后排查）"""
