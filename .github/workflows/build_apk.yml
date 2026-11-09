@@ -210,6 +210,15 @@ jobs:
           BUILD_EXIT=${PIPESTATUS[2]}
           echo ""
           echo "Buildozer exit code: $BUILD_EXIT"
+          # 失败时把错误尾巴直接打到 Actions 日志里，避免还要下载 artifact 才能看到原因
+          if [ "$BUILD_EXIT" -ne 0 ]; then
+            echo ""
+            echo "########## BUILD ERROR TAIL (start) ##########"
+            grep -nE "Traceback|ERROR|error:|Error|failed|Failed|Exception|usage:" build_apk.log 2>/dev/null | tail -60 || true
+            echo "----- last 120 lines -----"
+            tail -n 120 build_apk.log 2>/dev/null || true
+            echo "########## BUILD ERROR TAIL (end) ##########"
+          fi
           exit $BUILD_EXIT
         shell: bash
 
