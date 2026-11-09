@@ -53,6 +53,9 @@ APP_FOLDER = _resolve_app_folder()
 os.environ.setdefault("KIVY_HOME", join(APP_FOLDER, ".kivy"))
 CRASH_LOG = join(APP_FOLDER, "crash.log")
 BT_DEBUG_LOG = join(APP_FOLDER, "bt_debug.log")
+# 构建标识：每次发版改这里。显示在蓝牙弹窗标题和诊断日志首行，
+# 用来确认手机上装的到底是不是最新 APK（之前多次排查都被"旧包"误导）。
+BUILD_TAG = "b60"
 
 def _resolve_default_music_dir():
     """跨平台默认音乐目录：
@@ -804,6 +807,7 @@ class BluetoothService:
             threading.Thread(target=_sim, daemon=True).start()
             return
         # Android：先在主线程确认权限（未授权则弹授权框，授权成功后再回调继续扫描）
+        self._report(f"===== 构建 {BUILD_TAG} =====", status_cb)
         self._report("检查蓝牙权限...", status_cb)
         self.ensure_permissions(on_done=lambda: self._prepare_scan(callback), status_cb=status_cb)
 
@@ -962,16 +966,31 @@ class BluetoothService:
         if gen != getattr(self, "_scan_gen", 0):
             return
         try:
+            # 记录调用前状态：如果 isDiscovering 一直是 True，说明上一轮的取消还没生效，
+            # 这才是 startDiscovery() 返回 False 的真正原因。
+            try:
+                pre_discovering = self._bt_adapter.isDiscovering()
+            except Exception:
+                pre_discovering = "?"
             result = self._bt_adapter.startDiscovery()
-            print(f"[BT] startDiscovery() attempt={attempt} returned: {result}")
+            print(f"[BT] startDiscovery() attempt={attempt} preDiscovering={pre_discovering} returned: {result}")
             if result:
+                self._report("经典蓝牙扫描已启动", self.on_status)
                 return
         except Exception as e:
             print(f"[BT] startDiscovery error: {jni_detail(e)}")
-        if attempt < 3:
-            Clock.schedule_once(lambda dt: self._try_start_discovery(gen, attempt + 1), 0.6)
+        if attempt < 5:
+            # 逐步拉长间隔，给上层的 cancelDiscovery 更多时间落地
+            Clock.schedule_once(lambda dt: self._try_start_discovery(gen, attempt + 1),
+                                1.0 + attempt * 0.5)
         else:
-            self._report("经典蓝牙扫描启动失败（指望 BLE 扫描）", self.on_status)
+            try:
+                st = self._bt_adapter.getState()
+                disc = self._bt_adapter.isDiscovering()
+            except Exception:
+                st, disc = "?", "?"
+            self._report(f"经典扫描启动失败(state={st} isDiscovering={disc})，仅用 BLE 扫描",
+                         self.on_status)
 
     def _poll_scan_results(self, dt=None):
         """轮询 Java 侧收集到的扫描结果（0.6 秒一次）。
@@ -1608,7 +1627,7 @@ class MainScreen(Screen):
             except Exception:
                 pass
             dialog = MDDialog(
-                title="蓝牙设备",
+                title=f"蓝牙设备 · {BUILD_TAG}",
                 type="custom",
                 content_cls=content,
                 buttons=[close_btn],
