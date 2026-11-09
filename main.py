@@ -55,7 +55,7 @@ CRASH_LOG = join(APP_FOLDER, "crash.log")
 BT_DEBUG_LOG = join(APP_FOLDER, "bt_debug.log")
 # 构建标识：每次发版改这里。显示在蓝牙弹窗标题和诊断日志首行，
 # 用来确认手机上装的到底是不是最新 APK（之前多次排查都被"旧包"误导）。
-BUILD_TAG = "b60"
+BUILD_TAG = "b61"
 
 def _resolve_default_music_dir():
     """跨平台默认音乐目录：
@@ -920,6 +920,8 @@ class BluetoothService:
             self._BtBridge.reset()
         except Exception as e:
             print(f"[BT] bridge reset error: {jni_detail(e)}")
+        self._poll_count = 0
+        self._drain_total = 0
         self._report("正在扫描附近设备...", self.on_status)
         self._poll_ev = Clock.schedule_interval(self._poll_scan_results, 0.6)
 
@@ -958,6 +960,14 @@ class BluetoothService:
             discovering = a.isDiscovering()
             enabled = a.isEnabled()
             self._report(f"适配器状态: state={st} enabled={enabled} isDiscovering={discovering}")
+            # 已配对数量是个关键自检：能列出已配对说明适配器和 BLUETOOTH_CONNECT 都正常，
+            # 那扫描为空就只能是扫描链路（权限/广播回调）的问题。
+            try:
+                bonded = a.getBondedDevices()
+                n_bonded = bonded.size() if bonded is not None else 0
+                self._report(f"适配器自检: 本机={a.getAddress()} 已配对={n_bonded}个")
+            except Exception as e2:
+                self._report(f"适配器自检失败: {jni_detail(e2)}")
         except Exception as e:
             self._report(f"读取适配器状态失败: {jni_detail(e)}")
 
@@ -998,6 +1008,8 @@ class BluetoothService:
         bridge = getattr(self, "_BtBridge", None)
         if bridge is None:
             return
+        self._poll_count = getattr(self, "_poll_count", 0) + 1
+        self._drain_total = getattr(self, "_drain_total", 0)
         try:
             for raw in bridge.drain():
                 s = str(raw)
@@ -1009,15 +1021,21 @@ class BluetoothService:
                 rssi = parts[2].strip() if len(parts) > 2 else ""
                 if not addr or addr == "(unknown)":
                     continue
+                self._drain_total += 1
                 self._on_found({"name": name, "address": addr, "rssi": rssi})
         except Exception as e:
-            print(f"[BT] poll drain error: {jni_detail(e)}")
+            # 之前只 print 到 stdout，真机上根本看不到，务必写进诊断日志
+            self._report(f"扫描结果读取异常: {jni_detail(e)}", self.on_status)
         try:
             code = bridge.drainError()
             if code:
                 self._report(f"BLE 扫描失败: {self._ble_err_desc(code)}", self.on_status)
         except Exception as e:
-            print(f"[BT] poll error code failed: {jni_detail(e)}")
+            self._report(f"BLE 错误码读取异常: {jni_detail(e)}", self.on_status)
+        # 心跳：每 5 秒（约 8 次轮询）打一行，用来判断轮询是否在跑、有没有收到任何数据
+        if self._poll_count % 8 == 0:
+            self._report(f"扫描心跳: 轮询{self._poll_count}次 累计收到{self._drain_total}条",
+                         self.on_status)
 
     @staticmethod
     def _ble_err_desc(code):
