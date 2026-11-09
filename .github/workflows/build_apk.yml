@@ -218,6 +218,28 @@ jobs:
             echo "----- last 120 lines -----"
             tail -n 120 build_apk.log 2>/dev/null || true
             echo "########## BUILD ERROR TAIL (end) ##########"
+
+            # ① 写进 Step Summary：直接显示在 run 页面，不用展开日志
+            {
+              echo "## Build failed (buildozer exit $BUILD_EXIT)"
+              echo ""
+              echo "### Key error lines"
+              echo '```'
+              grep -nE "Traceback|ERROR|error:|Exception|FAILURE:|failed|usage:" build_apk.log 2>/dev/null | tail -30 || true
+              echo '```'
+              echo ""
+              echo "### Last 100 lines"
+              echo '```'
+              tail -n 100 build_apk.log 2>/dev/null || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+            # ② 用 annotation 打到 run 页面顶部（无需展开任何日志）
+            FIRSTERR=$(grep -E "Traceback|ERROR|error:|Exception|FAILURE:|failed|usage:" build_apk.log 2>/dev/null | tail -3 | tr '\n' ' ')
+            FIRSTERR=$(printf '%s' "$FIRSTERR" | sed 's/%/%25/g' | cut -c1-900)
+            if [ -n "$FIRSTERR" ]; then
+              echo "::error::${FIRSTERR}"
+            fi
           fi
           exit $BUILD_EXIT
         shell: bash
