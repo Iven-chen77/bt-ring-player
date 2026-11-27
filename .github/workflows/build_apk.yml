@@ -50,6 +50,16 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
 
+      # -------- Step 1.2: 固定 Python 版本 --------
+      # ubuntu-latest 的默认 python3 已是 3.14，而 buildozer 1.5.0 里
+      # `from urllib.request import FancyURLopener` 在 Python 3.14 已被移除，
+      # 直接 ImportError；升级到 buildozer 1.6.0 又要编译 plyvel（缺 leveldb 头文件）。
+      # 因此把构建用的 Python 固定到 3.12，两条路都避开。
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       # -------- Step 1.5: 构建前强制修复 buildozer.spec（双重保险）--------
       # 无论 GitHub 上的 spec 是否同步成功，这里用 sed 强制：
       #   1) 删除不存在的 android.storage_dir 配置项（buildozer 不识别）
@@ -131,6 +141,8 @@ jobs:
           # 必须锁 buildozer==1.5.0：1.6.0 新增了 plyvel 依赖，而 plyvel 没有
           # Python 3.14 的预编译轮子，源码编译又缺 leveldb/db.h，会直接导致
           # "Failed building wheel for plyvel"。1.5.0 不需要 plyvel。
+          # 注意：1.5.0 依赖 urllib.request.FancyURLopener，Python 3.14 已移除该类，
+          # 所以上面必须把 Python 固定到 3.12。
           python3 -m pip install "cython==3.0.11" "buildozer==1.5.0"
         shell: bash
 
