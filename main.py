@@ -55,7 +55,7 @@ CRASH_LOG = join(APP_FOLDER, "crash.log")
 BT_DEBUG_LOG = join(APP_FOLDER, "bt_debug.log")
 # 构建标识：每次发版改这里。显示在蓝牙弹窗标题和诊断日志首行，
 # 用来确认手机上装的到底是不是最新 APK（之前多次排查都被"旧包"误导）。
-BUILD_TAG = "b61"
+BUILD_TAG = "b62"
 
 def _resolve_default_music_dir():
     """跨平台默认音乐目录：
@@ -846,6 +846,7 @@ class BluetoothService:
 
     def _cleanup_scan(self):
         """停止上一次扫描：取消轮询、注销旧广播接收器、停 BLE 扫描"""
+        self._scan_active = False
         ev = getattr(self, "_poll_ev", None)
         if ev is not None:
             try:
@@ -922,6 +923,7 @@ class BluetoothService:
             print(f"[BT] bridge reset error: {jni_detail(e)}")
         self._poll_count = 0
         self._drain_total = 0
+        self._scan_active = True
         self._report("正在扫描附近设备...", self.on_status)
         self._poll_ev = Clock.schedule_interval(self._poll_scan_results, 0.6)
 
@@ -1007,6 +1009,10 @@ class BluetoothService:
         结果格式：name|address|rssi"""
         bridge = getattr(self, "_BtBridge", None)
         if bridge is None:
+            return
+        # 扫描已停止（_cleanup_scan 已把 _scan_active 置 False）后不再收数据，
+        # 否则会出现在「扫描完成」之后列表还在继续增加的情况。
+        if not getattr(self, "_scan_active", False):
             return
         self._poll_count = getattr(self, "_poll_count", 0) + 1
         self._drain_total = getattr(self, "_drain_total", 0)
@@ -1310,13 +1316,15 @@ class BluetoothService:
         if state == self._BtBridge.GATT_DISCOVERED:
             self.connected = True
             self._gatt_mode = True
+            # 把服务/特征的 UUID 全部写进诊断日志：响铃指令到底该写到哪个特征，
+            # 只能靠这份清单判断（不同厂商完全不同），stdout 在真机上看不到。
             try:
                 chars = [str(c) for c in bridge.gattChars()]
-                for c in chars[:12]:
-                    print(f"[BT-GATT] 特征: {c}")
-                self._report(f"GATT 已就绪，共 {len(chars)} 个特征（详情见诊断日志）")
-            except Exception:
-                pass
+                self._report(f"GATT 已就绪，共 {len(chars)} 个特征")
+                for c in chars:
+                    self._report(f"  特征: {c}")
+            except Exception as e:
+                self._report(f"读取特征列表失败: {jni_detail(e)}")
             if self.on_connected:
                 self.on_connected(self.connected_device)
             return
@@ -1326,7 +1334,6 @@ class BluetoothService:
             self._safe_error(f"[GATT-连接] {msg or '连接失败'}")
             return
 
-        self._gatt_poll_count = getattr(self, "_gatt_poll_count", 0) + 1
         if self._gatt_poll_count > 30:
             self._safe_error("[GATT-超时] 连接超时（设备可能不在范围内、已关机、"
                              "或已被其他手机/系统蓝牙连接占用）")
