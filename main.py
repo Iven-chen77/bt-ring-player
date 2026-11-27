@@ -55,7 +55,7 @@ CRASH_LOG = join(APP_FOLDER, "crash.log")
 BT_DEBUG_LOG = join(APP_FOLDER, "bt_debug.log")
 # 构建标识：每次发版改这里。显示在蓝牙弹窗标题和诊断日志首行，
 # 用来确认手机上装的到底是不是最新 APK（之前多次排查都被"旧包"误导）。
-BUILD_TAG = "b62"
+BUILD_TAG = "b63"
 
 def _resolve_default_music_dir():
     """跨平台默认音乐目录：
@@ -285,6 +285,11 @@ from kivymd.icon_definitions import md_icons
 # ================= 常量配置 =================
 PREF_FILE = join(APP_FOLDER, "bt_prefs.json")
 RING_CMD = bytes([0xAA, 0x55, 0x01, 0x00, 0x01])  # 响铃指令示例帧，可按需修改
+# 目标设备名（首次使用、还没有历史记录时，靠它自动找到设备）。
+# 设备端还没开发完，先设成 ASR7799，确定正式名字后改这里即可。
+TARGET_BT_NAME = "ASR7799"
+# 连接成功后是否自动发一次响铃指令
+AUTO_RING_ON_CONNECT = True
 AUDIO_EXTS = (".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac")
 
 
@@ -844,6 +849,13 @@ class BluetoothService:
             traceback.print_exc()
             self._report(f"扫描准备失败: {jni_detail(e)}", self.on_status)
 
+    def stop_scan(self):
+        """外部主动停止扫描（例如按名称匹配到目标设备后立刻停下）"""
+        try:
+            self._cleanup_scan()
+        except Exception as e:
+            print(f"[BT] stop_scan error: {jni_detail(e)}")
+
     def _cleanup_scan(self):
         """停止上一次扫描：取消轮询、注销旧广播接收器、停 BLE 扫描"""
         self._scan_active = False
@@ -1194,8 +1206,10 @@ class BluetoothService:
                 print("[BT] bond completed")
                 Clock.schedule_once(lambda dt: self._connect_step3(dev), 0.1)
             elif self._bond_wait_count > 10:
-                print("[BT] bond timeout")
-                self._safe_error("配对超时")
+                # 没有完成配对不代表连不上：BLE 设备的 GATT 连接不需要配对。
+                # 继续走 step3，由它按设备类型选择 RFCOMM / GATT。
+                self._report("配对未完成，继续尝试连接（BLE 设备无需配对）")
+                Clock.schedule_once(lambda dt: self._connect_step3(dev), 0.1)
             else:
                 Clock.schedule_once(lambda dt: self._connect_wait_bond(dev), 1.0)
         except Exception as e:
@@ -1409,29 +1423,77 @@ class BluetoothService:
         except Exception as e:
             return False, f"发送失败: {jni_detail(e)}"
 
-    # -------- 自动重连：尝试连接上次保存的设备 --------
+    # -------- 自动重连：优先上次的地址，其次按蓝牙名搜索 --------
     def try_autoconnect(self, on_success, on_fail):
-        if not exists(PREF_FILE):
-            on_fail and on_fail("无历史设备")
-            return
+        """打开 App 时自动连接：
+        1) 有历史地址 -> 直接按 MAC 连（不要求已配对，BLE GATT 无需配对即可连）
+        2) 没有历史地址 -> 扫描附近设备，按 TARGET_BT_NAME 匹配后连接
+        """
+        addr = ""
+        name = ""
         try:
-            with open(PREF_FILE, "r", encoding="utf-8") as f:
-                last = json.load(f)
-            addr = last.get("address")
-            name = last.get("name", "历史设备")
-            if not addr:
-                on_fail and on_fail("无历史地址")
-                return
-            # 仅在已配对列表中存在时才自动连接
-            paired = self.get_paired_devices()
-            match = next((d for d in paired if d["address"] == addr), None)
-            if match:
-                self.connect(match, on_success=on_success,
-                             on_error=lambda e: on_fail and on_fail(e))
-            else:
-                on_fail and on_fail("历史设备不在已配对列表中")
+            if exists(PREF_FILE):
+                with open(PREF_FILE, "r", encoding="utf-8") as f:
+                    last = json.load(f)
+                addr = (last.get("address") or "").strip()
+                name = (last.get("name") or "").strip()
         except Exception as e:
-            on_fail and on_fail(str(e))
+            self._report(f"读取上次设备失败: {jni_detail(e)}")
+
+        if addr:
+            self._report(f"自动连接(历史设备): {name or '?'} ({addr})")
+            self.connect({"name": name or addr, "address": addr},
+                         on_success=on_success,
+                         on_error=lambda e: on_fail and on_fail(e))
+            return
+
+        self._report(f"无历史设备，按名称搜索: {TARGET_BT_NAME}")
+        self._connect_by_name(on_success, on_fail)
+
+    def _connect_by_name(self, on_success, on_fail):
+        """扫描一次，按 TARGET_BT_NAME 匹配到设备后发起连接。"""
+        if not getattr(self, "_bt_adapter", None):
+            on_fail and on_fail("蓝牙未初始化")
+            return
+        found = {"dev": None}
+        timeout_ev = {"ev": None}
+
+        def _on_dev(dev):
+            if found["dev"] is not None:
+                return
+            dev_name = (dev.get("name") or "")
+            if TARGET_BT_NAME.lower() not in dev_name.lower():
+                return
+            found["dev"] = dev
+            self._report(f"名称匹配成功: {dev_name} ({dev['address']})，开始连接")
+            ev = timeout_ev.get("ev")
+            if ev is not None:
+                try:
+                    ev.cancel()
+                except Exception:
+                    pass
+            try:
+                self.stop_scan()
+            except Exception:
+                pass
+            # 记下名字，方便下次直连
+            self.save_last_device(dev)
+            self.connect(dev, on_success=on_success,
+                         on_error=lambda e: on_fail and on_fail(e))
+
+        def _timeout(dt):
+            if found["dev"] is None:
+                try:
+                    self.stop_scan()
+                except Exception:
+                    pass
+                on_fail and on_fail(f"未找到名为 {TARGET_BT_NAME} 的设备")
+
+        try:
+            self.start_scan(_on_dev)
+            timeout_ev["ev"] = Clock.schedule_once(_timeout, 22)
+        except Exception as e:
+            on_fail and on_fail(f"搜索失败: {jni_detail(e)}")
 
     def save_last_device(self, device):
         try:
@@ -1625,6 +1687,15 @@ class MainScreen(Screen):
         self.status_text = "[color=#4CAF50]已连接[/color]"
         self.device_name = f"{device['name']} ({device['address']})"
         BT.save_last_device(device)
+        # 连上后自动发起一次响铃服务
+        if AUTO_RING_ON_CONNECT:
+            Clock.schedule_once(self._auto_ring, 1.0)
+
+    def _auto_ring(self, dt=None):
+        if not BT.connected:
+            return
+        ok, msg = BT.send_ring_cmd()
+        App.get_running_app().toast(msg, error=not ok)
 
     def _on_autoconnect_fail(self, msg):
         self.status_text = "未连接 (点击蓝牙按键连接)"
